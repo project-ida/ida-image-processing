@@ -7,7 +7,7 @@ import argparse
 # Argument parsing
 parser = argparse.ArgumentParser(description="Extract JPGs from OME-TIFF Z-stacks.")
 parser.add_argument('--folder', required=True, help="Folder containing .ome.tif files.")
-args = parser.parse_args()
+args = parser.parse_args() 
 
 # Path to your folder with .ome.tif files
 input_folder = Path(args.folder)

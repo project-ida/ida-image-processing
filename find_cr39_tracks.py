@@ -11,7 +11,7 @@ Expected image layout:
 Where:
     <sample_id> : Provided as a command-line argument.
     <z_index>   : Provided as a second command-line argument.
-    <zoom_level>: Matches the ZOOM_LEVEL constant in this script.
+    <zoom_level>: Provided as a third command-line argument.
     <X>, <Y>    : Integer tile coordinates (used for tile_position in DB).
 
 Features extracted for each track:
@@ -27,11 +27,10 @@ Overlay output:
     - Original image is overwritten with overlay applied.
 
 Usage:
-    python script.py <sample_id> <z_index>
+    python script.py <sample_id> <z_index> <zoom_level>
 
 Configuration (constants at top of file):
     DATA_FOLDER : Root directory for data (default: "data")
-    ZOOM_LEVEL  : Zoom level subfolder to process
     MIN_AREA    : Minimum pit area in pixels
     SAVE_TO_DB  : Set to True to insert results into PostgreSQL
 """
@@ -48,7 +47,6 @@ from psql_credentials import PGHOST, PGPORT, PGDATABASE, PGUSER, PGPASSWORD
 
 # === CONFIGURATION ===
 DATA_FOLDER = "data"
-ZOOM_LEVEL = 4
 MIN_AREA = 1  # pixels
 SAVE_TO_DB = True
 
@@ -150,8 +148,8 @@ def save_overlay(img, overlays, out_path):
 
 # === MAIN ===
 def main():
-    if len(sys.argv) != 3:
-        print("ERROR: Missing arguments `python script.py <sample_id> <z_index>`")
+    if len(sys.argv) != 4:
+        print("ERROR: Missing arguments `python script.py <sample_id> <z_index> <zoom_level>`")
         sys.exit(1)
 
     sample_id = sys.argv[1]
@@ -161,8 +159,14 @@ def main():
         print("ERROR: z_index must be an integer")
         sys.exit(1)
 
+    try:
+        zoom_level = int(sys.argv[3])
+    except ValueError:
+        print("ERROR: zoom_level must be an integer")
+        sys.exit(1)
+
     z_folder = f"{sample_id}_Z{z_index}"
-    input_folder = os.path.join(DATA_FOLDER, sample_id, z_folder, str(ZOOM_LEVEL))
+    input_folder = os.path.join(DATA_FOLDER, sample_id, z_folder, str(zoom_level))
 
     if not os.path.isdir(input_folder):
         print(f"Folder not found: {input_folder}")
@@ -172,7 +176,7 @@ def main():
     cur = conn.cursor()
 
     num_files_processed = 0
-    print(f"Processing {sample_id} Z{z_index} at zoom level {ZOOM_LEVEL}")
+    print(f"Processing {sample_id} Z{z_index} at zoom level {zoom_level}")
     for filename in os.listdir(input_folder):
         if not filename.lower().endswith(".png"):
             continue
@@ -198,7 +202,7 @@ def main():
                     INSERT INTO cr39_tracks (sample_id, tile_position, track_position, features, z_index)
                     VALUES (%s, %s, %s, %s, %s)
                 """, (
-                    sample_id,                      # text                      # integer
+                    sample_id,                      # text
                     [tile_x, tile_y],               # integer[]
                     [res['track_position'][0], res['track_position'][1]],  # double precision[]
                     [

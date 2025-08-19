@@ -7,12 +7,13 @@ PostgreSQL database, and overwrite the original images with visual overlays
 marking the detected tracks.
 
 Expected image layout:
-    data/<sample_id>/<sample_id>_Z<z_index>/<zoom_level>/<X>_<Y>.png
+    <sample_path>/<sample_id>_Z<z_index>/<zoom_level>/<X>_<Y>.png
 Where:
-    <sample_id> : Provided as a command-line argument.
-    <z_index>   : Provided as a second command-line argument.
-    <zoom_level>: Provided as a third command-line argument.
-    <X>, <Y>    : Integer tile coordinates (used for tile_position in DB).
+    <sample_path> : Full path to the sample folder (e.g. /mnt/data/SAMPLE123)
+    <sample_id>   : Automatically extracted from the last part of <sample_path>.
+    <z_index>     : Provided as a second command-line argument.
+    <zoom_level>  : Provided as a third command-line argument.
+    <X>, <Y>      : Integer tile coordinates (used for tile_position in DB).
 
 Features extracted for each track:
     - Diameter
@@ -27,13 +28,8 @@ Overlay output:
     - Original image is overwritten with overlay applied.
 
 Example usage:
-    python script.py SAMPLE123 0 4
-    python script.py SAMPLE456 2 8
-
-Configuration (constants at top of file):
-    DATA_FOLDER : Root directory for data (default: "data")
-    MIN_AREA    : Minimum pit area in pixels
-    SAVE_TO_DB  : Set to True to insert results into PostgreSQL
+    python script.py /mnt/storage/experiment_runs/SAMPLE123 0 4
+    python script.py ./data/SAMPLE456 2 8
 """
 
 import os
@@ -47,7 +43,6 @@ from matplotlib.patches import Ellipse, Circle
 from psql_credentials import PGHOST, PGPORT, PGDATABASE, PGUSER, PGPASSWORD
 
 # === CONFIGURATION ===
-DATA_FOLDER = "data"
 MIN_AREA = 1  # pixels
 SAVE_TO_DB = True
 
@@ -153,8 +148,8 @@ def parse_args():
         description="Detect particle tracks in CR39 detector plate images, extract features, "
                     "save overlays, and optionally store results in PostgreSQL."
     )
-    parser.add_argument("sample_id",
-                        help="Sample identifier (e.g. SAMPLE123)")
+    parser.add_argument("sample_path",
+                        help="Full path to the sample folder (e.g. /mnt/data/SAMPLE123)")
     parser.add_argument("z_index", type=int,
                         help="Z-stack index (integer, e.g. 0, 1, 2)")
     parser.add_argument("zoom_level", type=int,
@@ -164,12 +159,14 @@ def parse_args():
 # === MAIN ===
 def main():
     args = parse_args()
-    sample_id = args.sample_id
+
+    sample_path = os.path.abspath(args.sample_path)
+    sample_id = os.path.basename(os.path.normpath(sample_path))
     z_index = args.z_index
     zoom_level = args.zoom_level
 
     z_folder = f"{sample_id}_Z{z_index}"
-    input_folder = os.path.join(DATA_FOLDER, sample_id, z_folder, str(zoom_level))
+    input_folder = os.path.join(sample_path, z_folder, str(zoom_level))
 
     if not os.path.isdir(input_folder):
         print(f"Folder not found: {input_folder}")

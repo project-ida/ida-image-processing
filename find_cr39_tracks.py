@@ -7,7 +7,7 @@ PostgreSQL database, and overwrite the original images with visual overlays
 marking the detected tracks.
 
 Expected image layout:
-    <sample_path>/<sample_id>_Z<z_index>/<zoom_level>/<X>_<Y>.png
+    <sample_path>/<sample_id>_Z<z_index>/<zoom_level>/<X>_<Y>.jpg
 Where:
     <sample_path> : Full path to the sample folder (e.g. /mnt/data/SAMPLE123)
     <sample_id>   : Automatically extracted from the last part of <sample_path>.
@@ -41,6 +41,7 @@ import argparse
 import matplotlib.pyplot as plt
 from matplotlib.patches import Ellipse, Circle
 from psql_credentials import PGHOST, PGPORT, PGDATABASE, PGUSER, PGPASSWORD
+import time
 
 # === CONFIGURATION ===
 MIN_AREA = 1  # pixels
@@ -172,17 +173,31 @@ def main():
         print(f"Folder not found: {input_folder}")
         sys.exit(1)
 
+    all_files = [f for f in os.listdir(input_folder) if f.lower().endswith(".jpg")]
+    total_files = len(all_files)
+
     conn = get_connection()
     cur = conn.cursor()
 
     num_files_processed = 0
-    print(f"Processing {sample_id} Z{z_index} at zoom level {zoom_level}")
-    for filename in os.listdir(input_folder):
-        if not filename.lower().endswith(".png"):
-            continue
+    start_time = time.time()
+
+    for idx, filename in enumerate(all_files, start=1):
         try:
             num_files_processed += 1
-            print(f"Processing {filename}")
+
+            # Calculate elapsed and ETA
+            elapsed = time.time() - start_time
+            avg_time = elapsed / idx
+            remaining = avg_time * (total_files - idx)
+
+            elapsed_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
+            eta_str = time.strftime("%H:%M:%S", time.gmtime(remaining))
+
+            print(f"Processing {sample_id} Z{z_index} at zoom level {zoom_level} "
+                  f"(file {idx} of {total_files}: {filename}) "
+                  f"[elapsed {elapsed_str}, ETA {eta_str}]")
+
             tile_x, tile_y = map(int, filename.rsplit(".", 1)[0].split("_"))
         except ValueError:
             print(f"Skipping {filename}: invalid name format")
@@ -218,7 +233,7 @@ def main():
     conn.commit()
     cur.close()
     conn.close()
-    print(f"Finished processing {num_files_processed} files.")
+    print(f"Finished processing {num_files_processed} files in {time.strftime('%H:%M:%S', time.gmtime(time.time()-start_time))}.")
 
 if __name__ == "__main__":
     main()

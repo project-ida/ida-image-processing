@@ -10,9 +10,9 @@ Expected image layout:
     data/<sample_id>/<sample_id>_Z<z_index>/<zoom_level>/<X>_<Y>.png
 Where:
     <sample_id> : Provided as a command-line argument.
-    <z_index>       : Provided as a second command-line argument.
-    <zoom_level>    : Matches the ZOOM_LEVEL constant in this script.
-    <X>, <Y>        : Integer tile coordinates (used for tile_position in DB).
+    <z_index>   : Provided as a second command-line argument.
+    <zoom_level>: Matches the ZOOM_LEVEL constant in this script.
+    <X>, <Y>    : Integer tile coordinates (used for tile_position in DB).
 
 Features extracted for each track:
     - Diameter
@@ -155,7 +155,11 @@ def main():
         sys.exit(1)
 
     sample_id = sys.argv[1]
-    z_index = sys.argv[2]
+    try:
+        z_index = int(sys.argv[2])
+    except ValueError:
+        print("ERROR: z_index must be an integer")
+        sys.exit(1)
 
     z_folder = f"{sample_id}_Z{z_index}"
     input_folder = os.path.join(DATA_FOLDER, sample_id, z_folder, str(ZOOM_LEVEL))
@@ -188,19 +192,20 @@ def main():
 
         results, overlays = extract_features(img, min_area=MIN_AREA)
 
-        if SAVE_TO_DB == True:
+        if SAVE_TO_DB:
             for res in results:
                 cur.execute("""
-                    INSERT INTO cr39_tracks (sample_id, tile_position, track_position, features)
-                    VALUES (%s, %s, %s, %s)
+                    INSERT INTO cr39_tracks (sample_id, tile_position, track_position, features, z_index)
+                    VALUES (%s, %s, %s, %s, %s)
                 """, (
-                    sample_id,                      # text
-                    [tile_x, tile_y],                   # integer[]
+                    sample_id,                      # text                      # integer
+                    [tile_x, tile_y],               # integer[]
                     [res['track_position'][0], res['track_position'][1]],  # double precision[]
                     [
                         float(res['features']['minor']),
                         float(res['features']['major'])
-                    ]  # numeric[]
+                    ],  # numeric[]
+                    z_index,  
                 ))
 
         # Overwrite image with overlay

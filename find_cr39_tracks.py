@@ -7,9 +7,9 @@ PostgreSQL database, and overwrite the original images with visual overlays
 marking the detected tracks.
 
 Expected image layout:
-    data/<experiment_id>/<experiment_id>_Z<z_index>/<zoom_level>/<X>_<Y>.png
+    data/<sample_id>/<sample_id>_Z<z_index>/<zoom_level>/<X>_<Y>.png
 Where:
-    <experiment_id> : Provided as a command-line argument.
+    <sample_id> : Provided as a command-line argument.
     <z_index>       : Provided as a second command-line argument.
     <zoom_level>    : Matches the ZOOM_LEVEL constant in this script.
     <X>, <Y>        : Integer tile coordinates (used for tile_position in DB).
@@ -27,7 +27,7 @@ Overlay output:
     - Original image is overwritten with overlay applied.
 
 Usage:
-    python script.py <experiment_id> <z_index>
+    python script.py <sample_id> <z_index>
 
 Configuration (constants at top of file):
     DATA_FOLDER : Root directory for data (default: "data")
@@ -151,14 +151,14 @@ def save_overlay(img, overlays, out_path):
 # === MAIN ===
 def main():
     if len(sys.argv) != 3:
-        print("ERROR: Missing arguments `python script.py <experiment_id> <z_index>`")
+        print("ERROR: Missing arguments `python script.py <sample_id> <z_index>`")
         sys.exit(1)
 
-    experiment_id = sys.argv[1]
+    sample_id = sys.argv[1]
     z_index = sys.argv[2]
 
-    z_folder = f"{experiment_id}_Z{z_index}"
-    input_folder = os.path.join(DATA_FOLDER, experiment_id, z_folder, str(ZOOM_LEVEL))
+    z_folder = f"{sample_id}_Z{z_index}"
+    input_folder = os.path.join(DATA_FOLDER, sample_id, z_folder, str(ZOOM_LEVEL))
 
     if not os.path.isdir(input_folder):
         print(f"Folder not found: {input_folder}")
@@ -168,7 +168,7 @@ def main():
     cur = conn.cursor()
 
     num_files_processed = 0
-    print(f"Processing {experiment_id} Z{z_index} at zoom level {ZOOM_LEVEL}")
+    print(f"Processing {sample_id} Z{z_index} at zoom level {ZOOM_LEVEL}")
     for filename in os.listdir(input_folder):
         if not filename.lower().endswith(".png"):
             continue
@@ -191,10 +191,10 @@ def main():
         if SAVE_TO_DB == True:
             for res in results:
                 cur.execute("""
-                    INSERT INTO cr39_tracks (experiment_id, tile_position, track_position, features)
+                    INSERT INTO cr39_tracks (sample_id, tile_position, track_position, features)
                     VALUES (%s, %s, %s, %s)
                 """, (
-                    experiment_id,                      # text
+                    sample_id,                      # text
                     [tile_x, tile_y],                   # integer[]
                     [res['track_position'][0], res['track_position'][1]],  # double precision[]
                     [

@@ -26,8 +26,9 @@ Overlay output:
     - Green ellipse or circle drawn around each detected pit.
     - Original image is overwritten with overlay applied.
 
-Usage:
-    python script.py <sample_id> <z_index> <zoom_level>
+Example usage:
+    python script.py SAMPLE123 0 4
+    python script.py SAMPLE456 2 8
 
 Configuration (constants at top of file):
     DATA_FOLDER : Root directory for data (default: "data")
@@ -35,12 +36,12 @@ Configuration (constants at top of file):
     SAVE_TO_DB  : Set to True to insert results into PostgreSQL
 """
 
-
 import os
 import sys
 import cv2
 import psycopg2
 import numpy as np
+import argparse
 import matplotlib.pyplot as plt
 from matplotlib.patches import Ellipse, Circle
 from psql_credentials import PGHOST, PGPORT, PGDATABASE, PGUSER, PGPASSWORD
@@ -146,24 +147,26 @@ def save_overlay(img, overlays, out_path):
     plt.savefig(out_path, dpi=150, bbox_inches='tight', pad_inches=0)
     plt.close()
 
+# === ARGUMENT PARSING ===
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Detect particle tracks in CR39 detector plate images, extract features, "
+                    "save overlays, and optionally store results in PostgreSQL."
+    )
+    parser.add_argument("sample_id",
+                        help="Sample identifier (e.g. SAMPLE123)")
+    parser.add_argument("z_index", type=int,
+                        help="Z-stack index (integer, e.g. 0, 1, 2)")
+    parser.add_argument("zoom_level", type=int,
+                        help="Zoom level subfolder to process (integer, e.g. 4)")
+    return parser.parse_args()
+
 # === MAIN ===
 def main():
-    if len(sys.argv) != 4:
-        print("ERROR: Missing arguments `python script.py <sample_id> <z_index> <zoom_level>`")
-        sys.exit(1)
-
-    sample_id = sys.argv[1]
-    try:
-        z_index = int(sys.argv[2])
-    except ValueError:
-        print("ERROR: z_index must be an integer")
-        sys.exit(1)
-
-    try:
-        zoom_level = int(sys.argv[3])
-    except ValueError:
-        print("ERROR: zoom_level must be an integer")
-        sys.exit(1)
+    args = parse_args()
+    sample_id = args.sample_id
+    z_index = args.z_index
+    zoom_level = args.zoom_level
 
     z_folder = f"{sample_id}_Z{z_index}"
     input_folder = os.path.join(DATA_FOLDER, sample_id, z_folder, str(zoom_level))

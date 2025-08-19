@@ -166,7 +166,7 @@ def main():
     z_index = args.z_index
     zoom_level = args.zoom_level
 
-    z_folder = f"{sample_id}_Z{z_index}"
+    z_folder = f"{sample_id}_Z{z_index}_files"
     input_folder = os.path.join(sample_path, z_folder, str(zoom_level))
 
     if not os.path.isdir(input_folder):

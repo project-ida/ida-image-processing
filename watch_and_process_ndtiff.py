@@ -1,21 +1,4 @@
 #!/usr/bin/env python3
-"""
-watch_and_process_ndtiff.py — recursive polling watcher for NDTiff datasets.
-
-Debug-friendly behavior:
-- Processes only datasets that DO NOT yet have auto_process.log in them.
-  → Delete auto_process.log to force a re-run.
-
-Logic (no quiescence fallback):
-1) Recursively find folders containing NDTiff.index without auto_process.log
-2) Try:
-     d = ndstorage.Dataset(folder)
-     d.is_finished() → must be True
-   If open or is_finished() fails, skip and retry next poll.
-3) Wait a small grace period, then run:
-     a) stitch_ndtiff.py <dataset> --scale <SCALE> --channel <CHANNEL>
-     b) dzi_from_bigtiff.py <dataset>\stitched --split-channel
-"""
 
 import os
 import sys

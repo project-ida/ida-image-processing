@@ -12,7 +12,7 @@ from ndstorage import Dataset
 
 # ---------- fixed config ----------
 POLL_SECONDS   = 60                      # check once per minute
-GRACE_AFTER_FINISH_SECONDS = 60          # wait after is_finished() before processing
+GRACE_AFTER_FINISH_SECONDS = 5          # wait after is_finished() before processing
 INDEX_NAME     = "NDTiff.index"          # identifies a dataset root
 LOG_NAME       = "auto_process.log"      # per-dataset log (presence gates processing)
 WRITE_MASTER_LOG = True                  # also keep one global log in BASE_DIR

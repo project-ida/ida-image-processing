@@ -136,14 +136,6 @@ def main():
                     log_master(f"[{ds.name}] Dataset open failed ({e.__class__.__name__}: {e}); retry later.")
                     continue
 
-                try:
-                    if not bool(d.is_finished()):
-                        # Not finished yet; just retry later
-                        continue
-                except Exception as e:
-                    log_master(f"[{ds.name}] is_finished() failed ({e.__class__.__name__}: {e}); retry later.")
-                    continue
-
                 log_master(f"[{ds.name}] Finished detected; waiting {GRACE_AFTER_FINISH_SECONDS}s before processing.")
                 time.sleep(GRACE_AFTER_FINISH_SECONDS)
 

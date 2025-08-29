@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-watch_and_process_ndtiff.py — simple polling watcher for NDTiff datasets.
+watch_and_process_ndtiff.py — simple polling watcher for NDTiff datasets (recursive).
 
 Debug-friendly behavior:
 - Processes only datasets that DO NOT yet have auto_process.log in them.
-  → Delete auto_process.log to force a re-run for debugging.
+  → Delete auto_process.log to force a re-run.
 
 Assumptions:
 - ndstorage is installed; completeness check uses Dataset.is_finished() only.
@@ -14,6 +14,7 @@ Assumptions:
     2) python dzi_from_bigtiff.py <dataset_folder>\\stitched --split-channel
 """
 
+import os
 import sys
 import time
 import argparse
@@ -63,16 +64,18 @@ def log_ds(ds_dir: Path, msg: str) -> None:
         except Exception:
             pass
 
-def is_dataset_folder(p: Path) -> bool:
-    return p.is_dir() and (p / INDEX_NAME).exists()
-
-def list_candidate_datasets(base: Path) -> Iterable[Path]:
-    """Immediate subfolders with NDTiff.index and NO dataset log yet."""
+def list_candidate_datasets_recursive(base: Path) -> Iterable[Path]:
+    """
+    Recursively scan for folders that contain NDTiff.index and do NOT yet have auto_process.log.
+    Uses os.walk to avoid missing nested datasets; returns dataset folder paths.
+    """
     if not base.exists():
         return []
-    for child in base.iterdir():
-        if is_dataset_folder(child) and not (child / LOG_NAME).exists():
-            yield child
+    for root, dirs, files in os.walk(base):
+        # Optional: skip hidden/system dirs (uncomment if useful)
+        # dirs[:] = [d for d in dirs if not d.startswith('.')]
+        if INDEX_NAME in files and LOG_NAME not in files:
+            yield Path(root)
 
 def run_processing(ds_dir: Path, script_dir: Path) -> bool:
     """Run the two steps; return True on success."""
@@ -101,8 +104,8 @@ def run_processing(ds_dir: Path, script_dir: Path) -> bool:
     return True
 
 def parse_args():
-    ap = argparse.ArgumentParser(description="Watch for finished NDTiff datasets and process them.")
-    ap.add_argument("--base-dir", required=True, help="Folder where new NDTiff datasets appear")
+    ap = argparse.ArgumentParser(description="Watch for finished NDTiff datasets (recursively) and process them.")
+    ap.add_argument("--base-dir", required=True, help="Root folder to scan recursively for NDTiff datasets")
     ap.add_argument("--scale", default="1.0", help="Scale passed to stitch_ndtiff.py (default: 1.0)")
     ap.add_argument("--channel", default="g", help="Channel passed to stitch_ndtiff.py (default: g)")
     return ap.parse_args()
@@ -122,12 +125,12 @@ def main():
     MASTER_LOG_PATH = BASE_DIR / "watcher.log"
     script_dir = Path(__file__).resolve().parent
 
-    log_master(f"Watching {BASE_DIR} (scripts in {script_dir}) | scale={SCALE} channel={CHANNEL}")
+    log_master(f"Watching (recursive) {BASE_DIR} (scripts in {script_dir}) | scale={SCALE} channel={CHANNEL}")
 
     while True:
         try:
             # Pick up datasets that (a) look like NDTiff roots, (b) have no dataset log yet
-            for ds in list_candidate_datasets(BASE_DIR):
+            for ds in list_candidate_datasets_recursive(BASE_DIR):
                 # Only proceed when writer has finalized the dataset
                 try:
                     d = Dataset(str(ds))

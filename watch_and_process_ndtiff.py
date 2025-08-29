@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """
-watch_and_process_ndtiff.py — simple polling watcher for NDTiff datasets (recursive).
+watch_and_process_ndtiff.py — recursive polling watcher for NDTiff datasets.
 
 Debug-friendly behavior:
 - Processes only datasets that DO NOT yet have auto_process.log in them.
   → Delete auto_process.log to force a re-run.
 
-Assumptions:
-- ndstorage is installed; completeness check uses Dataset.is_finished() only.
-- This script lives in the SAME folder as stitch_ndtiff.py and dzi_from_bigtiff.py.
-- After a dataset is finished, it runs:
-    1) python stitch_ndtiff.py <dataset_folder> --scale <SCALE> --channel <CHANNEL>
-    2) python dzi_from_bigtiff.py <dataset_folder>\\stitched --split-channel
+Logic (no quiescence fallback):
+1) Recursively find folders containing NDTiff.index without auto_process.log
+2) Try:
+     d = ndstorage.Dataset(folder)
+     d.is_finished() → must be True
+   If open or is_finished() fails, skip and retry next poll.
+3) Wait a small grace period, then run:
+     a) stitch_ndtiff.py <dataset> --scale <SCALE> --channel <CHANNEL>
+     b) dzi_from_bigtiff.py <dataset>\stitched --split-channel
 """
 
 import os
@@ -24,15 +27,15 @@ from datetime import datetime
 from typing import Iterable
 from ndstorage import Dataset
 
-# ------------------ Fixed config (edit if desired) ------------------
+# ---------- fixed config ----------
 POLL_SECONDS   = 60                      # check once per minute
 GRACE_AFTER_FINISH_SECONDS = 60          # wait after is_finished() before processing
 INDEX_NAME     = "NDTiff.index"          # identifies a dataset root
 LOG_NAME       = "auto_process.log"      # per-dataset log (presence gates processing)
 WRITE_MASTER_LOG = True                  # also keep one global log in BASE_DIR
-# --------------------------------------------------------------------
+# ----------------------------------
 
-# Will be filled from CLI:
+# filled from CLI:
 BASE_DIR: Path
 SCALE: str
 CHANNEL: str
@@ -51,7 +54,6 @@ def log_master(msg: str) -> None:
             pass
 
 def log_ds(ds_dir: Path, msg: str) -> None:
-    """Write to dataset log + master log."""
     line = f"[{ts()}][{ds_dir.name}] {msg}\n"
     print(line, end="")
     try:
@@ -66,14 +68,11 @@ def log_ds(ds_dir: Path, msg: str) -> None:
 
 def list_candidate_datasets_recursive(base: Path) -> Iterable[Path]:
     """
-    Recursively scan for folders that contain NDTiff.index and do NOT yet have auto_process.log.
-    Uses os.walk to avoid missing nested datasets; returns dataset folder paths.
+    Recursively yield dataset roots: folders with NDTiff.index and without auto_process.log.
     """
     if not base.exists():
         return []
     for root, dirs, files in os.walk(base):
-        # Optional: skip hidden/system dirs (uncomment if useful)
-        # dirs[:] = [d for d in dirs if not d.startswith('.')]
         if INDEX_NAME in files and LOG_NAME not in files:
             yield Path(root)
 
@@ -104,7 +103,7 @@ def run_processing(ds_dir: Path, script_dir: Path) -> bool:
     return True
 
 def parse_args():
-    ap = argparse.ArgumentParser(description="Watch for finished NDTiff datasets (recursively) and process them.")
+    ap = argparse.ArgumentParser(description="Watch (recursively) for finished NDTiff datasets and process them.")
     ap.add_argument("--base-dir", required=True, help="Root folder to scan recursively for NDTiff datasets")
     ap.add_argument("--scale", default="1.0", help="Scale passed to stitch_ndtiff.py (default: 1.0)")
     ap.add_argument("--channel", default="g", help="Channel passed to stitch_ndtiff.py (default: g)")
@@ -129,22 +128,26 @@ def main():
 
     while True:
         try:
-            # Pick up datasets that (a) look like NDTiff roots, (b) have no dataset log yet
             for ds in list_candidate_datasets_recursive(BASE_DIR):
-                # Only proceed when writer has finalized the dataset
+                # Try to open and verify finished; any failure → skip, we'll retry next minute
                 try:
                     d = Dataset(str(ds))
-                    if not d.is_finished():
+                except Exception as e:
+                    log_master(f"[{ds.name}] Dataset open failed ({e.__class__.__name__}: {e}); retry later.")
+                    continue
+
+                try:
+                    if not bool(d.is_finished()):
+                        # Not finished yet; just retry later
                         continue
                 except Exception as e:
-                    log_master(f"[{ds.name}] ndstorage open/read failed: {e}")
+                    log_master(f"[{ds.name}] is_finished() failed ({e.__class__.__name__}: {e}); retry later.")
                     continue
 
                 log_master(f"[{ds.name}] Finished detected; waiting {GRACE_AFTER_FINISH_SECONDS}s before processing.")
                 time.sleep(GRACE_AFTER_FINISH_SECONDS)
 
-                # Create the dataset log *now* (start of real processing). From here on,
-                # presence of this file means "already handled" unless you delete it.
+                # Start processing (creating the dataset log now enables the 'delete to retry' behavior)
                 log_ds(ds, "Processing started.")
                 ok = run_processing(ds, script_dir)
                 if ok:

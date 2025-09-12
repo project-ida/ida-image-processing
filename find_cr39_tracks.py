@@ -6,16 +6,51 @@ particle tracks (pits), extract geometric features, optionally store them in a
 PostgreSQL database, and overwrite the original images with visual overlays 
 marking the detected tracks.
 
-Expected image layout:
-    <sample_path>/<sample_id>_Z<z_index>/<zoom_level>/<X>_<Y>.jpg
-Where:
-    <sample_path> : Full path to the sample folder (e.g. /mnt/data/SAMPLE123)
-    <sample_id>   : Automatically extracted from the last part of <sample_path>.
-    <z_index>     : Provided as a second command-line argument.
-    <zoom_level>  : Provided as a third command-line argument.
-    <X>, <Y>      : Integer tile coordinates (used for tile_position in DB).
+---
+INPUTS (command-line arguments)
+1. sample_path (str, required)
+   - Full path to the sample folder containing the data.
+   - Example: /mnt/storage/experiment_runs/SAMPLE123
+   - The final folder name is treated as the sample_id (e.g. "SAMPLE123").
 
-Features extracted for each track:
+2. z_index (int, required)
+   - Integer identifying which Z-stack to process.
+   - Example: 0, 1, 2
+   - Used to construct a subfolder name in the form "<sample_id>_Z<z_index>_files".
+
+3. zoom_level (int, required)
+   - Integer identifying which zoom level subfolder to process.
+   - Example: 4, 8
+   - Used to construct the path to the actual image tiles.
+
+---
+EXPECTED IMAGE LAYOUT ON DISK
+The script expects the following structure:
+
+    <sample_path>/
+        <sample_id>_Z<z_index>_files/
+            <zoom_level>/
+                <X>_<Y>.jpg
+
+Where:
+    <sample_path>   : The directory you pass as the first argument.
+    <sample_id>     : Derived automatically from the last part of <sample_path>.
+    <z_index>       : The integer you supply as the second argument.
+    <zoom_level>    : The integer you supply as the third argument.
+    <X>, <Y>        : Integer tile coordinates (extracted from each filename).
+
+For example, given:
+    sample_path = /mnt/storage/experiment_runs/SAMPLE123
+    z_index = 0
+    zoom_level = 4
+
+The script will look for images under:
+    /mnt/storage/experiment_runs/SAMPLE123/SAMPLE123_Z0_files/4/
+with filenames like:
+    0_0.jpg, 0_1.jpg, 1_0.jpg, 1_1.jpg
+
+---
+FEATURES EXTRACTED FOR EACH TRACK:
     - Diameter
     - Major axis length
     - Minor axis length
@@ -23,13 +58,23 @@ Features extracted for each track:
     - Lightest pixel coordinates (x_light, y_light)
     - Darkest pixel coordinates (x_dark, y_dark)
 
-Overlay output:
-    - Green ellipse or circle drawn around each detected pit.
-    - Original image is overwritten with overlay applied.
+---
+OUTPUTS:
+1. **Overlay Images**: 
+   - Each processed .jpg is overwritten with a version containing green ellipses/circles marking detected pits.
 
-Example usage:
-    python script.py /mnt/storage/experiment_runs/SAMPLE123 0 4
-    python script.py ./data/SAMPLE456 2 8
+2. **Database Records (if SAVE_TO_DB=True)**:
+   - A row per track is inserted into the "cr39_tracks" table with:
+        - sample_id (text)
+        - tile_position ([X, Y])
+        - track_position ([cx, cy])
+        - features ([minor, major])
+        - z_index (int)
+
+---
+EXAMPLE USAGE:
+    python find_tracks.py /mnt/storage/experiment_runs/SAMPLE123 0 4
+    python find_tracks.py ./data/SAMPLE456 2 8
 """
 
 import os

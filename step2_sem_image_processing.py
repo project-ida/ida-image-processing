@@ -233,7 +233,7 @@ def main(argv: list[str] | None = None) -> int:
     xs = np.array(xs_um, dtype=float)
     ys = np.array(ys_um, dtype=float)
 
-    if args.invert-x:
+    if args.invert_x:
         xs = -xs
 
     xs -= xs.min()

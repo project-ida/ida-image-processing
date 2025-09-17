@@ -153,7 +153,7 @@ def main(argv: list[str] | None = None) -> int:
     sem_dir: Path = args.sem_folder
     meta_dir: Path = args.metadata_folder
     outdir: Path = args.outdir
-    tiles_dir: Path = outdir / args.tiles-subdir
+    tiles_dir: Path = outdir / args.tiles_subdir
     tiles_dir.mkdir(parents=True, exist_ok=True)
 
     files = sorted(sem_dir.glob(args.glob))
@@ -161,7 +161,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[WARN] No SEM files found in {sem_dir} with pattern {args.glob}", file=sys.stderr)
         return 1
 
-    print(f"[INFO] Found {len(files)} SEM file(s). out={args.out-format}, norm={args.norm}, gamma={args.gamma}, auto-clip={args.auto_clip_percent}")
+    print(f"[INFO] Found {len(files)} SEM file(s). out={args.out_format}, norm={args.norm}, gamma={args.gamma}, auto-clip={args.auto_clip_percent}")
 
     records = []      # (basename, x_um, y_um)
     umppx_x_vals = [] # from X Step / width

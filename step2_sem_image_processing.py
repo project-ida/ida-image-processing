@@ -176,20 +176,39 @@ def write_tileconfig(out_path: Path, entries: List[Tuple[str, float, float]]) ->
 
 # ----------------------------- Grid helpers ----------------------------
 
-def robust_pitch(vals_um: np.ndarray) -> float:
-    """Estimate the dominant pitch from stage positions using NN differences."""
+def robust_pitch(vals_um: np.ndarray, prior_um: float | None = None) -> float:
+    """
+    Estimate dominant pitch along an axis from stage positions.
+
+    Strategy:
+      • De-jitter by rounding positions (to 1 µm).
+      • Compute nearest-neighbour diffs, drop ~0 diffs.
+      • Focus on the upper 30% of diffs (true pitch >> jitter).
+      • If a metadata prior is available, snap near it.
+    """
     v = np.sort(np.asarray(vals_um, float))
+    # de-jitter: round to 1 µm and uniquify
+    v = np.unique(np.round(v, 1))
     d = np.diff(v)
-    d = d[d > 1e-3]  # drop zeros/duplicates
+    d = d[d > 1e-3]
     if d.size == 0:
-        return 1.0
-    lo, hi = np.percentile(d, [5, 95])
-    band = d[(d >= lo) & (d <= hi)]
-    hist, edges = np.histogram(band, bins=60)
-    peak = 0.5 * (edges[np.argmax(hist)] + edges[np.argmax(hist) + 1])
-    mask = (d > 0.8 * peak) & (d < 1.2 * peak)
-    pitch = float(np.median(d[mask])) if np.any(mask) else float(np.median(d))
+        return prior_um if prior_um and prior_um > 0 else 1.0
+
+    # prefer larger gaps (grid pitch) over tiny creep
+    p70 = np.percentile(d, 70.0)
+    big = d[d >= p70]
+    pitch = float(np.median(big)) if big.size else float(np.median(d))
+
+    if prior_um and prior_um > 0:
+        # If we have a prior (~632 µm), prefer values close to it
+        near = d[(d > 0.8 * prior_um) & (d < 1.2 * prior_um)]
+        if near.size:
+            pitch = float(np.median(near))
+        elif not (0.5 * prior_um <= pitch <= 1.5 * prior_um):
+            pitch = float(prior_um)
+
     return max(pitch, 1e-6)
+
 
 
 # --------------------------------- CLI ---------------------------------
@@ -351,12 +370,16 @@ def main(argv: List[str] | None = None) -> int:
             print("[WARN] --grid-size must be like 19x26; falling back to auto.", file=sys.stderr)
             step_um_x = robust_pitch(xs); step_um_y = robust_pitch(ys); source = "auto"
     else:
-        step_um_x = robust_pitch(xs)
-        step_um_y = robust_pitch(ys)
-        # inferred cols/rows for info
-        cols = int(round((xs.max() - xs.min()) / step_um_x)) + 1
-        rows = int(round((ys.max() - ys.min()) / step_um_y)) + 1
-        source = "auto"
+        # metadata prior from X/Y Step, if present
+        prior_x = float(np.median(step_um_x_candidates)) if step_um_x_candidates else None
+        prior_y = float(np.median(step_um_y_candidates)) if step_um_y_candidates else None
+    
+        step_um_x = robust_pitch(xs, prior_x)
+        step_um_y = robust_pitch(ys, prior_y)
+
+    cols = int(round((xs.max() - xs.min()) / step_um_x)) + 1
+    rows = int(round((ys.max() - ys.min()) / step_um_y)) + 1
+    source = "auto(prior)"
 
     eps_x = max(args.index_epsilon_frac * step_um_x, 1e-9)
     eps_y = max(args.index_epsilon_frac * step_um_y, 1e-9)

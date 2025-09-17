@@ -1,41 +1,29 @@
 #!/usr/bin/env python3
 """
-Step 2 — SEM image → tiles + Fiji TileConfiguration.txt
+Step 2 — SEM image → tiles + Fiji TileConfiguration.txt (+ tile-audit)
 
-Features
---------
-- Writes TileConfiguration.txt **into the tiles folder** (same dir as images)
-- --out-format {png8,tiff16} (16-bit TIFF preserves dynamic range)
-- --norm {auto,absolute16,absolute,fixed}  (+ --vmin/--vmax for fixed)
-- --auto-clip-percent P  (if --norm auto, clip low/high Pth percentile)
-- --gamma g              (gamma<1 brightens; >1 darkens)
-- --invert-x / --invert-y (applied BEFORE normalization)
-- --auto-um-per-px       (median from X/Y Step in metadata / image size)
-- Per-tile print of normalization used (lo/hi, gamma)
-- Corner sanity print (which files end up at TL/TR/BL/BR after transforms)
+New:
+- TileConfiguration.txt is written into the *tiles folder*
+- --out-format {png8,tiff16}, normalization knobs (--norm, --auto-clip-percent, --gamma)
+- --auto-um-per-px from metadata X/Y Step (median across tiles)
+- **Tile audit**: report skipped tiles (no metadata), missing grid cells, duplicates
+  → printed summary and full details in tiles_audit.txt
 
-Notes
------
-- Open TileConfiguration.txt from the tiles folder in Fiji and **leave**
-  "Invert X/Y coordinates" **unchecked** if you used the flip flags here.
-- If metadata is missing for a tile, the image is still written, but that
-  tile is excluded from TileConfiguration (warning printed).
+Fiji note:
+- Generate layout here; in Fiji's stitching dialog leave "Invert X/Y coordinates" UNchecked.
 """
 
 from __future__ import annotations
-import argparse
-import sys
-import re
+import argparse, re, sys
 from pathlib import Path
-from typing import Tuple, Dict, List
-
+from typing import Dict, List, Tuple
 import numpy as np
 from PIL import Image
 
 # -------------------------- Metadata helpers --------------------------
 
 def parse_metadata_txt(path: Path) -> Dict[str, str]:
-    """Accept both 'key = value' and 'key: value' lines."""
+    """Accept 'key = value' and 'key: value' lines."""
     meta: Dict[str, str] = {}
     if not path.exists():
         return meta
@@ -54,10 +42,7 @@ def parse_metadata_txt(path: Path) -> Dict[str, str]:
 _num_re = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
 
 def meta_num(meta: Dict[str, str], key_suffix: str, default: float | None = None) -> float | None:
-    """
-    Find first key whose name ends with `key_suffix` (case-insensitive)
-    and return the first numeric token in its value as a float.
-    """
+    """First numeric in any key that endswith(key_suffix), case-insensitive."""
     ksuf = key_suffix.lower()
     for k, v in meta.items():
         if k.lower().endswith(ksuf):
@@ -72,17 +57,12 @@ def meta_num(meta: Dict[str, str], key_suffix: str, default: float | None = None
 # ---------------------------- Image I/O --------------------------------
 
 def load_sem_npz(npz_path: Path) -> np.ndarray:
-    """
-    Load a 2D SEM image array from NPZ.
-    Prefer key 'sem_data'; otherwise fall back to the first array key.
-    """
+    """Load 2D SEM image from NPZ (prefer 'sem_data', else first key)."""
     with np.load(npz_path) as z:
-        if "sem_data" in z.files:
-            arr = z["sem_data"]
-        else:
-            if not z.files:
-                raise ValueError("empty NPZ")
-            arr = z[z.files[0]]
+        key = "sem_data" if "sem_data" in z.files else (z.files[0] if z.files else None)
+        if key is None:
+            raise ValueError("empty NPZ")
+        arr = z[key]
     if arr.ndim != 2:
         raise ValueError(f"{npz_path.name}: expected 2D array, got shape {arr.shape}")
     return arr
@@ -90,7 +70,7 @@ def load_sem_npz(npz_path: Path) -> np.ndarray:
 def compute_lo_hi(arr: np.ndarray, method: str,
                   vmin: float | None, vmax: float | None,
                   auto_clip_percent: float) -> Tuple[float, float]:
-    """Decide normalization range (lo, hi)."""
+    """Pick normalization range (lo, hi)."""
     a = arr.astype(np.float64, copy=False)
     if method == "auto":
         if auto_clip_percent and auto_clip_percent > 0:
@@ -105,8 +85,7 @@ def compute_lo_hi(arr: np.ndarray, method: str,
         lo, hi = 0.0, 65535.0
     elif method == "absolute":
         if np.issubdtype(arr.dtype, np.integer):
-            info = np.iinfo(arr.dtype)
-            lo, hi = float(info.min), float(info.max)
+            info = np.iinfo(arr.dtype); lo, hi = float(info.min), float(info.max)
         else:
             lo, hi = float(np.nanmin(a)), float(np.nanmax(a))
     else:
@@ -116,74 +95,56 @@ def compute_lo_hi(arr: np.ndarray, method: str,
     return lo, hi
 
 def scale_to_uint8(arr: np.ndarray, lo: float, hi: float, gamma: float) -> np.ndarray:
-    """Scale arr in [lo,hi] → uint8 with gamma (gamma<1 brightens)."""
     a = arr.astype(np.float64, copy=False)
     a = (a - lo) / max(hi - lo, 1e-12)
     a = np.clip(a, 0.0, 1.0)
-    if gamma and gamma != 1.0:
-        a = np.power(a, gamma)
+    if gamma and gamma != 1.0: a = np.power(a, gamma)
     return (a * 255.0 + 0.5).astype(np.uint8)
 
 def scale_to_uint16(arr: np.ndarray, method: str, lo: float, hi: float, gamma: float) -> np.ndarray:
-    """
-    16-bit output:
-    - absolute16: clip to [0..65535] (pass-through if source is uint16 in that range)
-    - others    : scale to 0..65535, apply gamma
-    """
     if method == "absolute16":
-        a = np.clip(arr, 0.0, 65535.0)
-        return a.astype(np.uint16)
+        return np.clip(arr, 0.0, 65535.0).astype(np.uint16)
     a = arr.astype(np.float64, copy=False)
     a = (a - lo) / max(hi - lo, 1e-12)
     a = np.clip(a, 0.0, 1.0)
-    if gamma and gamma != 1.0:
-        a = np.power(a, gamma)
+    if gamma and gamma != 1.0: a = np.power(a, gamma)
     return (a * 65535.0 + 0.5).astype(np.uint16)
 
 # ----------------------- TileConfiguration.txt -------------------------
 
 def write_tileconfig(out_path: Path, entries: List[Tuple[str, float, float]]) -> None:
-    """entries: list of (basename, x_px, y_px)."""
-    lines = []
-    lines.append("# Define the number of dimensions we are working on")
-    lines.append("dim = 2")
-    lines.append("")
-    lines.append("# Define the image coordinates")
-    for name, x, y in entries:
-        lines.append(f"{name}; ; ({x:.3f}, {y:.3f})")
+    lines = ["# Define the number of dimensions we are working on",
+             "dim = 2", "", "# Define the image coordinates"]
+    lines += [f"{name}; ; ({x:.3f}, {y:.3f})" for name, x, y in entries]
     out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 # --------------------------------- CLI ---------------------------------
 
-def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description="Convert SEM NPZ to tiles and build TileConfiguration.txt")
-    p.add_argument("--sem-folder", required=True, type=Path, help="Folder with *_sem.npz files.")
-    p.add_argument("--metadata-folder", required=True, type=Path, help="Folder with *_metadata.txt files.")
-    p.add_argument("--outdir", type=Path, default=Path("processeddata"), help="Output base folder.")
-    p.add_argument("--tiles-subdir", type=str, default="sem-images-png", help="Subfolder (under outdir) for tiles.")
-    p.add_argument("--tileconfig-name", type=str, default="TileConfiguration.txt", help="Name for the Fiji layout file.")
-    p.add_argument("--glob", type=str, default="*_sem.npz", help="Glob for SEM files.")
-    # tile image format + normalization
-    p.add_argument("--out-format", choices=["png8", "tiff16"], default="png8", help="Tile image format.")
-    p.add_argument("--norm", choices=["auto", "absolute", "absolute16", "fixed"], default="auto", help="Intensity normalization.")
-    p.add_argument("--vmin", type=float, default=None, help="Used if --norm fixed.")
-    p.add_argument("--vmax", type=float, default=None, help="Used if --norm fixed.")
-    p.add_argument("--auto-clip-percent", type=float, default=0.0,
-                   help="If --norm auto: clip low/high percentiles (e.g., 1.0).")
-    p.add_argument("--gamma", type=float, default=1.0,
-                   help="Gamma correction after normalization (gamma<1 brightens; >1 darkens).")
-    # stage → pixel mapping
-    p.add_argument("--um-per-px", type=float, default=0.5490099, help="µm per pixel (used unless --auto-um-per-px).")
-    p.add_argument("--auto-um-per-px", action="store_true",
-                   help="Derive µm/px from metadata X/Y Step and image size (median across tiles).")
-    p.add_argument("--invert-x", action="store_true", help="Invert stage X before normalization (mirror around Y).")
-    p.add_argument("--invert-y", action="store_true", help="Invert stage Y before normalization (mirror around X).")
+def main(argv: List[str] | None = None) -> int:
+    p = argparse.ArgumentParser(description="Convert SEM NPZ to tiles and build TileConfiguration.txt (+ audit)")
+    p.add_argument("--sem-folder", required=True, type=Path)
+    p.add_argument("--metadata-folder", required=True, type=Path)
+    p.add_argument("--outdir", type=Path, default=Path("processeddata"))
+    p.add_argument("--tiles-subdir", type=str, default="sem-images-png")
+    p.add_argument("--tileconfig-name", type=str, default="TileConfiguration.txt")
+    p.add_argument("--glob", type=str, default="*_sem.npz")
+    # tiles + normalization
+    p.add_argument("--out-format", choices=["png8", "tiff16"], default="png8")
+    p.add_argument("--norm", choices=["auto", "absolute", "absolute16", "fixed"], default="auto")
+    p.add_argument("--vmin", type=float, default=None)
+    p.add_argument("--vmax", type=float, default=None)
+    p.add_argument("--auto-clip-percent", type=float, default=0.0)
+    p.add_argument("--gamma", type=float, default=1.0)
+    # mapping
+    p.add_argument("--um-per-px", type=float, default=0.5490099)
+    p.add_argument("--auto-um-per-px", action="store_true")
+    p.add_argument("--invert-x", action="store_true")
+    p.add_argument("--invert-y", action="store_true")
     args = p.parse_args(argv)
 
-    sem_dir: Path = args.sem_folder
-    meta_dir: Path = args.metadata_folder
-    outdir: Path = args.outdir
-    tiles_dir: Path = outdir / args.tiles_subdir
+    sem_dir, meta_dir = args.sem_folder, args.metadata_folder
+    outdir = args.outdir
+    tiles_dir = outdir / args.tiles_subdir
     tiles_dir.mkdir(parents=True, exist_ok=True)
 
     files = sorted(sem_dir.glob(args.glob))
@@ -194,62 +155,59 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[INFO] Found {len(files)} SEM file(s). out={args.out_format}, norm={args.norm}, "
           f"gamma={args.gamma}, auto-clip={args.auto_clip_percent}")
 
-    records: List[Tuple[str, float, float]] = []  # (basename, x_um, y_um)
-    umppx_x_vals: List[float] = []  # from X Step / width
-    umppx_y_vals: List[float] = []  # from Y Step / height
+    # For audit/reporting
+    all_tile_names: List[str] = []
+    skipped_tiles: List[str] = []  # no/invalid metadata
+    tile_sizes: List[Tuple[int, int]] = []
+    step_um_x_candidates: List[float] = []
+    step_um_y_candidates: List[float] = []
+
+    # Records used for TileConfiguration
+    records: List[Tuple[str, float, float]] = []  # (tile_name, x_um, y_um)
 
     for i, sem_path in enumerate(files, 1):
         base_full = sem_path.stem
         base = base_full[:-4] if base_full.endswith("_sem") else base_full
 
-        # load image
         try:
-            arr = np.asarray(load_sem_npz(sem_path))
+            arr = load_sem_npz(sem_path)
         except Exception as e:
             print(f"[ERROR] {sem_path.name}: load failed → {e}", file=sys.stderr)
             continue
 
         H, W = arr.shape
+        tile_sizes.append((W, H))
 
-        # normalization range
+        # normalization and export
         lo, hi = compute_lo_hi(arr, args.norm, args.vmin, args.vmax, args.auto_clip_percent)
-
-        # export tile
         out_name = f"{base}_sem." + ("png" if args.out_format == "png8" else "tif")
         out_path = tiles_dir / out_name
         if args.out_format == "png8":
-            img8 = scale_to_uint8(arr, lo, hi, args.gamma)
-            Image.fromarray(img8, mode="L").save(out_path)
-        else:  # tiff16
-            img16 = scale_to_uint16(arr, args.norm, lo, hi, args.gamma)
-            Image.fromarray(img16, mode="I;16").save(out_path)
+            Image.fromarray(scale_to_uint8(arr, lo, hi, args.gamma), mode="L").save(out_path)
+        else:
+            Image.fromarray(scale_to_uint16(arr, args.norm, lo, hi, args.gamma), mode="I;16").save(out_path)
+        print(f"[{i}/{len(files)}] {out_name} ({W}×{H})  norm={args.norm} lo={lo:.3g} hi={hi:.3g} gamma={args.gamma}")
+        all_tile_names.append(out_name)
 
-        print(f"[{i}/{len(files)}] {out_path.name} ({W}×{H})  "
-              f"norm={args.norm} lo={lo:.3g} hi={hi:.3g} gamma={args.gamma}")
-
-        # metadata → stage + (optional) steps
+        # metadata
         meta_path = meta_dir / f"{base}_metadata.txt"
         if not meta_path.exists():
             alt = sem_path.with_name(f"{base}_metadata.txt")
-            if alt.exists():
-                meta_path = alt
+            if alt.exists(): meta_path = alt
         meta = parse_metadata_txt(meta_path) if meta_path.exists() else {}
-        if not meta:
-            print(f"    [WARN] metadata missing/empty for {base} — skip in TileConfiguration")
-            continue
 
         x_mm = meta_num(meta, "Stage Position/X")
         y_mm = meta_num(meta, "Stage Position/Y")
         if x_mm is None or y_mm is None:
-            print(f"    [WARN] stage positions not found for {base} — skip in TileConfiguration")
+            print(f"    [WARN] stage positions missing for {base} — excluded from TileConfiguration")
+            skipped_tiles.append(out_name)
             continue
 
+        # step size (mm → µm), for audit/grid inference
         x_step_mm = meta_num(meta, "X Step")
         y_step_mm = meta_num(meta, "Y Step")
-        if x_step_mm:
-            umppx_x_vals.append((x_step_mm * 1000.0) / W)
-        if y_step_mm:
-            umppx_y_vals.append((y_step_mm * 1000.0) / H)
+        if x_step_mm: step_um_x_candidates.append(x_step_mm * 1000.0)
+        if y_step_mm: step_um_y_candidates.append(y_step_mm * 1000.0)
 
         records.append((out_name, x_mm * 1000.0, y_mm * 1000.0))
 
@@ -260,16 +218,19 @@ def main(argv: list[str] | None = None) -> int:
     # choose µm/px
     um_per_px = args.um_per_px
     if args.auto_um_per_px:
-        candidates = []
-        if umppx_x_vals: candidates.append(np.median(umppx_x_vals))
-        if umppx_y_vals: candidates.append(np.median(umppx_y_vals))
-        if candidates:
-            um_per_px = float(np.median(candidates))
-            print(f"[INFO] --auto-um-per-px → using {um_per_px:.6f} µm/px "
-                  f"(from {len(umppx_x_vals)} X and {len(umppx_y_vals)} Y samples)")
+        # infer from X/Y Step (µm) divided by image size (px)
+        umppx_candidates = []
+        if step_um_x_candidates and tile_sizes:
+            w_px = int(np.median([w for w, _ in tile_sizes]))
+            umppx_candidates.append(np.median(step_um_x_candidates) / max(w_px, 1))
+        if step_um_y_candidates and tile_sizes:
+            h_px = int(np.median([h for _, h in tile_sizes]))
+            umppx_candidates.append(np.median(step_um_y_candidates) / max(h_px, 1))
+        if umppx_candidates:
+            um_per_px = float(np.median(umppx_candidates))
+            print(f"[INFO] --auto-um-per-px → {um_per_px:.6f} µm/px (from X/Y Step & tile size)")
         else:
-            print(f"[WARN] --auto-um-per-px requested but no X/Y Step found; "
-                  f"using --um-per-px={um_per_px}", file=sys.stderr)
+            print(f"[WARN] --auto-um-per-px requested but no X/Y Step found; using --um-per-px={um_per_px}", file=sys.stderr)
     else:
         print(f"[INFO] Using manual --um-per-px = {um_per_px}")
 
@@ -279,22 +240,81 @@ def main(argv: list[str] | None = None) -> int:
     ys = np.array(ys_um, dtype=float)
     if args.invert_x: xs = -xs
     if args.invert_y: ys = -ys
-    xs -= xs.min()
-    ys -= ys.min()
-    xs_px = xs / um_per_px
-    ys_px = ys / um_per_px
+    xs -= xs.min(); ys -= ys.min()
+    xs_px = xs / um_per_px; ys_px = ys / um_per_px
 
-    # sort only for readability
+    # cosmetic order
     order = np.lexsort((xs_px, ys_px))
     entries = [(names[i], float(xs_px[i]), float(ys_px[i])) for i in order]
 
-    # write TileConfiguration **in the tiles folder**
+    # write TileConfiguration in tiles folder
     tile_path = tiles_dir / args.tileconfig_name
     write_tileconfig(tile_path, entries)
     print(f"[OK] Wrote {tile_path} with {len(entries)} entries")
-    print("     Open this file in Fiji from the same folder; leave 'Invert X/Y' unchecked.")
+    print("     Open from the same folder in Fiji; leave 'Invert X/Y' unchecked.")
 
-    # corner sanity (after flips + normalization)
+    # ---------------------- Tile Audit (missing / duplicates) ----------------------
+    audit_lines: List[str] = []
+    audit_lines.append(f"Tiles written: {len(all_tile_names)}")
+    audit_lines.append(f"Tiles in TileConfiguration (with stage positions): {len(names)}")
+    if skipped_tiles:
+        audit_lines.append(f"Skipped (no/invalid metadata): {len(skipped_tiles)}")
+        # show only first few inline; full list is in the file anyway
+        preview = ', '.join(skipped_tiles[:10])
+        audit_lines.append(f"  e.g. {preview}{' …' if len(skipped_tiles) > 10 else ''}")
+    else:
+        audit_lines.append("Skipped (no/invalid metadata): 0")
+
+    # infer tile size (px) and stage step (µm) for grid mapping
+    w_px_m = int(np.median([w for w, _ in tile_sizes])) if tile_sizes else 0
+    h_px_m = int(np.median([h for _, h in tile_sizes])) if tile_sizes else 0
+    step_um_x = (np.median(step_um_x_candidates) if step_um_x_candidates else w_px_m * um_per_px)
+    step_um_y = (np.median(step_um_y_candidates) if step_um_y_candidates else h_px_m * um_per_px)
+
+    # map each tile to grid index by rounding to nearest step
+    ix = np.rint(xs / max(step_um_x, 1e-9)).astype(int)
+    iy = np.rint(ys / max(step_um_y, 1e-9)).astype(int)
+    occ: Dict[Tuple[int, int], List[int]] = {}
+    for k in range(len(names)):
+        occ.setdefault((ix[k], iy[k]), []).append(k)
+
+    min_ix, max_ix = int(ix.min()), int(ix.max())
+    min_iy, max_iy = int(iy.min()), int(iy.max())
+    ncols = max_ix - min_ix + 1
+    nrows = max_iy - min_iy + 1
+    expected = {(i, j) for i in range(min_ix, max_ix + 1) for j in range(min_iy, max_iy + 1)}
+    present = set(occ.keys())
+    missing_cells = sorted(expected - present)
+    duplicates = [(cell, idxs) for cell, idxs in occ.items() if len(idxs) > 1]
+
+    audit_lines.append(f"Grid inference:")
+    audit_lines.append(f"  step_um ~ ({step_um_x:.3f}, {step_um_y:.3f}), tile_px ~ ({w_px_m},{h_px_m})")
+    audit_lines.append(f"  grid cols×rows ~ {ncols}×{nrows} → expected {ncols*nrows} cells")
+    audit_lines.append(f"  present {len(present)}, missing {len(missing_cells)}, duplicates {len(duplicates)}")
+
+    if missing_cells:
+        audit_lines.append("Missing cells (first 20 shown):")
+        for (cx, cy) in missing_cells[:20]:
+            x_um_miss = cx * step_um_x
+            y_um_miss = cy * step_um_y
+            audit_lines.append(f"  cell ({cx},{cy}) ~ stage (µm)=({x_um_miss:.1f},{y_um_miss:.1f}) "
+                               f"~ pixel (px)=({x_um_miss/um_per_px:.1f},{y_um_miss/um_per_px:.1f})")
+    if duplicates:
+        audit_lines.append("Duplicate cells (grid index → tiles):")
+        for (cell, idxs) in duplicates[:10]:
+            audit_lines.append(f"  {cell}: " + ", ".join(names[i] for i in idxs))
+
+    # print short summary
+    print("\n[Tile audit]")
+    for line in audit_lines[:10]:
+        print(line)
+    if len(audit_lines) > 10:
+        print("  … see full report in tiles_audit.txt")
+
+    # write full report
+    (tiles_dir / "tiles_audit.txt").write_text("\n".join(audit_lines) + "\n", encoding="utf-8")
+
+    # ---------------------- Corner sanity (quick visual check) ----------------------
     xn = xs / (xs.max() if xs.max() > 0 else 1.0)
     yn = ys / (ys.max() if ys.max() > 0 else 1.0)
     tl = int(np.argmin(xn + yn))

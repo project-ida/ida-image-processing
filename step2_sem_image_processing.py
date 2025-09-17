@@ -185,8 +185,7 @@ def main(argv: List[str] | None = None) -> int:
         print(f"[WARN] No SEM files found in {sem_dir} with pattern {args.glob}", file=sys.stderr)
         return 1
 
-    print(f"[INFO] Found {len(sem_paths)} SEM file(s). out={args.out_format}, norm={args.norm}, "
-          f"gamma={args.gamma}, clip={args.auto-clip-percent}")
+    print(f"[INFO] Found {len(sem_paths)} SEM file(s). out={args.out_format}, norm={args.norm}, "f"gamma={args.gamma}, clip={args.auto_clip_percent}")
 
     # -------- global normalization pre-pass --------
     global_lo_hi: Tuple[float, float] | None = None

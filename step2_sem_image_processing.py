@@ -2,18 +2,24 @@
 """
 Step 2 — SEM image → tiles + Fiji TileConfiguration.txt
 
-Features:
-- TileConfiguration.txt is written into the *tiles folder*
-- --auto-um-per-px : compute µm/px from metadata (X/Y Step) + image size
-- --out-format     : png8 or tiff16 (16-bit preserves dynamic range)
-- --gamma          : gamma correction after normalization (gamma<1 brightens)
-- --auto-clip-percent : (auto only) clip low/high percentiles to boost contrast
-- Per-tile print of normalization values actually applied
-- Corner sanity print (which files wind up at TL/TR/BL/BR)
+Features
+--------
+- Writes TileConfiguration.txt **into the tiles folder** (same dir as images)
+- --out-format {png8,tiff16} (16-bit TIFF preserves dynamic range)
+- --norm {auto,absolute16,absolute,fixed}  (+ --vmin/--vmax for fixed)
+- --auto-clip-percent P  (if --norm auto, clip low/high Pth percentile)
+- --gamma g              (gamma<1 brightens; >1 darkens)
+- --invert-x / --invert-y (applied BEFORE normalization)
+- --auto-um-per-px       (median from X/Y Step in metadata / image size)
+- Per-tile print of normalization used (lo/hi, gamma)
+- Corner sanity print (which files end up at TL/TR/BL/BR after transforms)
 
-Fiji note:
-- When you generate the layout with the flags here, leave
-  “Invert X/Y coordinates” *unchecked* in the stitching dialog.
+Notes
+-----
+- Open TileConfiguration.txt from the tiles folder in Fiji and **leave**
+  "Invert X/Y coordinates" **unchecked** if you used the flip flags here.
+- If metadata is missing for a tile, the image is still written, but that
+  tile is excluded from TileConfiguration (warning printed).
 """
 
 from __future__ import annotations
@@ -21,15 +27,16 @@ import argparse
 import sys
 import re
 from pathlib import Path
+from typing import Tuple, Dict, List
 
 import numpy as np
 from PIL import Image
 
 # -------------------------- Metadata helpers --------------------------
 
-def parse_metadata_txt(path: Path) -> dict[str, str]:
-    """Accepts both 'key = value' and 'key: value' lines."""
-    meta: dict[str, str] = {}
+def parse_metadata_txt(path: Path) -> Dict[str, str]:
+    """Accept both 'key = value' and 'key: value' lines."""
+    meta: Dict[str, str] = {}
     if not path.exists():
         return meta
     for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
@@ -46,8 +53,11 @@ def parse_metadata_txt(path: Path) -> dict[str, str]:
 
 _num_re = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
 
-def meta_num(meta: dict[str, str], key_suffix: str, default: float | None = None) -> float | None:
-    """Return first numeric value for a key that ends with key_suffix (case-insensitive)."""
+def meta_num(meta: Dict[str, str], key_suffix: str, default: float | None = None) -> float | None:
+    """
+    Find first key whose name ends with `key_suffix` (case-insensitive)
+    and return the first numeric token in its value as a float.
+    """
     ksuf = key_suffix.lower()
     for k, v in meta.items():
         if k.lower().endswith(ksuf):
@@ -61,9 +71,25 @@ def meta_num(meta: dict[str, str], key_suffix: str, default: float | None = None
 
 # ---------------------------- Image I/O --------------------------------
 
+def load_sem_npz(npz_path: Path) -> np.ndarray:
+    """
+    Load a 2D SEM image array from NPZ.
+    Prefer key 'sem_data'; otherwise fall back to the first array key.
+    """
+    with np.load(npz_path) as z:
+        if "sem_data" in z.files:
+            arr = z["sem_data"]
+        else:
+            if not z.files:
+                raise ValueError("empty NPZ")
+            arr = z[z.files[0]]
+    if arr.ndim != 2:
+        raise ValueError(f"{npz_path.name}: expected 2D array, got shape {arr.shape}")
+    return arr
+
 def compute_lo_hi(arr: np.ndarray, method: str,
                   vmin: float | None, vmax: float | None,
-                  auto_clip_percent: float) -> tuple[float, float]:
+                  auto_clip_percent: float) -> Tuple[float, float]:
     """Decide normalization range (lo, hi)."""
     a = arr.astype(np.float64, copy=False)
     if method == "auto":
@@ -101,7 +127,7 @@ def scale_to_uint8(arr: np.ndarray, lo: float, hi: float, gamma: float) -> np.nd
 def scale_to_uint16(arr: np.ndarray, method: str, lo: float, hi: float, gamma: float) -> np.ndarray:
     """
     16-bit output:
-    - absolute16: pass-throughish (clip 0..65535), ignores gamma/lo/hi
+    - absolute16: clip to [0..65535] (pass-through if source is uint16 in that range)
     - others    : scale to 0..65535, apply gamma
     """
     if method == "absolute16":
@@ -116,7 +142,7 @@ def scale_to_uint16(arr: np.ndarray, method: str, lo: float, hi: float, gamma: f
 
 # ----------------------- TileConfiguration.txt -------------------------
 
-def write_tileconfig(out_path: Path, entries: list[tuple[str, float, float]]) -> None:
+def write_tileconfig(out_path: Path, entries: List[Tuple[str, float, float]]) -> None:
     """entries: list of (basename, x_px, y_px)."""
     lines = []
     lines.append("# Define the number of dimensions we are working on")
@@ -143,7 +169,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--vmin", type=float, default=None, help="Used if --norm fixed.")
     p.add_argument("--vmax", type=float, default=None, help="Used if --norm fixed.")
     p.add_argument("--auto-clip-percent", type=float, default=0.0,
-                   help="If --norm auto: clip low/high percentiles by this amount (e.g., 1.0).")
+                   help="If --norm auto: clip low/high percentiles (e.g., 1.0).")
     p.add_argument("--gamma", type=float, default=1.0,
                    help="Gamma correction after normalization (gamma<1 brightens; >1 darkens).")
     # stage → pixel mapping
@@ -168,9 +194,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[INFO] Found {len(files)} SEM file(s). out={args.out_format}, norm={args.norm}, "
           f"gamma={args.gamma}, auto-clip={args.auto_clip_percent}")
 
-    records = []      # (basename, x_um, y_um)
-    umppx_x_vals = [] # from X Step / width
-    umppx_y_vals = [] # from Y Step / height
+    records: List[Tuple[str, float, float]] = []  # (basename, x_um, y_um)
+    umppx_x_vals: List[float] = []  # from X Step / width
+    umppx_y_vals: List[float] = []  # from Y Step / height
 
     for i, sem_path in enumerate(files, 1):
         base_full = sem_path.stem
@@ -185,9 +211,10 @@ def main(argv: list[str] | None = None) -> int:
 
         H, W = arr.shape
 
-        # compute lo/hi for normalization & export
+        # normalization range
         lo, hi = compute_lo_hi(arr, args.norm, args.vmin, args.vmax, args.auto_clip_percent)
 
+        # export tile
         out_name = f"{base}_sem." + ("png" if args.out_format == "png8" else "tif")
         out_path = tiles_dir / out_name
         if args.out_format == "png8":
@@ -200,7 +227,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[{i}/{len(files)}] {out_path.name} ({W}×{H})  "
               f"norm={args.norm} lo={lo:.3g} hi={hi:.3g} gamma={args.gamma}")
 
-        # metadata
+        # metadata → stage + (optional) steps
         meta_path = meta_dir / f"{base}_metadata.txt"
         if not meta_path.exists():
             alt = sem_path.with_name(f"{base}_metadata.txt")
@@ -217,7 +244,6 @@ def main(argv: list[str] | None = None) -> int:
             print(f"    [WARN] stage positions not found for {base} — skip in TileConfiguration")
             continue
 
-        # gather µm/px candidates if available
         x_step_mm = meta_num(meta, "X Step")
         y_step_mm = meta_num(meta, "Y Step")
         if x_step_mm:
@@ -242,7 +268,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[INFO] --auto-um-per-px → using {um_per_px:.6f} µm/px "
                   f"(from {len(umppx_x_vals)} X and {len(umppx_y_vals)} Y samples)")
         else:
-            print(f"[WARN] --auto-um-per-px requested but no X/Y Step found; using --um-per-px={um_per_px}", file=sys.stderr)
+            print(f"[WARN] --auto-um-per-px requested but no X/Y Step found; "
+                  f"using --um-per-px={um_per_px}", file=sys.stderr)
     else:
         print(f"[INFO] Using manual --um-per-px = {um_per_px}")
 
@@ -261,14 +288,13 @@ def main(argv: list[str] | None = None) -> int:
     order = np.lexsort((xs_px, ys_px))
     entries = [(names[i], float(xs_px[i]), float(ys_px[i])) for i in order]
 
-    # Write TileConfiguration into the *tiles* folder
-    tile_path = (tiles_dir / args.tileconfig_name)
+    # write TileConfiguration **in the tiles folder**
+    tile_path = tiles_dir / args.tileconfig_name
     write_tileconfig(tile_path, entries)
     print(f"[OK] Wrote {tile_path} with {len(entries)} entries")
     print("     Open this file in Fiji from the same folder; leave 'Invert X/Y' unchecked.")
 
-    # Corner sanity (after flips + normalization)
-    # Normalize to 0..1 for a balanced "closest corner" test
+    # corner sanity (after flips + normalization)
     xn = xs / (xs.max() if xs.max() > 0 else 1.0)
     yn = ys / (ys.max() if ys.max() > 0 else 1.0)
     tl = int(np.argmin(xn + yn))

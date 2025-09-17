@@ -2,19 +2,40 @@
 """
 Step 2 — SEM image → tiles + Fiji TileConfiguration.txt
 
-Adds:
-- --dup-policy {keep,first,last,closest}  (resolve duplicate grid cells)
-- duplicates_resolved.txt report
-- Keeps: global normalization, audit (with neighbors), corner sanity,
-         tiff16/png8, invert-x/y, auto-um-per-px, TileConfiguration in tiles folder.
+Features
+--------
+• Output tiles as PNG-8 or TIFF-16
+• Global normalization (--norm global) with --auto-clip-percent and --gamma
+• TileConfiguration.txt written into the tiles folder
+• Auto µm/px from metadata X/Y Step + tile size (--auto-um-per-px)
+• Robust grid inference from stage positions (no grid size required)
+• Optional --grid-size COLSxROWS override and --index-epsilon-frac tolerance
+• Duplicate handling: --dup-policy {keep,first,last,closest}
+• Audit (missing cells + neighbors, duplicates), corner sanity print
+
+Inputs
+------
+--sem-folder:        directory with "<base>_sem.npz" (2D image in 'sem_data' or first array)
+--metadata-folder:   directory with "<base>_metadata.txt" (key=value or key: value)
+                      should contain stage X/Y in mm under keys ending with:
+                      "/Stage Position/X", "/Stage Position/Y"
+Outputs
+-------
+<outdir>/<tiles-subdir>/*.png or *.tif
+<outdir>/<tiles-subdir>/TileConfiguration.txt
+<outdir>/<tiles-subdir>/tiles_audit.txt
+<outdir>/<tiles-subdir>/duplicates_resolved.txt   (when dedup applied)
 """
 
 from __future__ import annotations
-import argparse, re, sys
+import argparse
+import sys, re
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
+
 import numpy as np
 from PIL import Image
+
 
 # -------------------------- Metadata helpers --------------------------
 
@@ -47,6 +68,7 @@ def meta_num(meta: Dict[str, str], key_suffix: str, default: float | None = None
                 except Exception:
                     pass
     return default
+
 
 # ---------------------------- Image I/O --------------------------------
 
@@ -90,17 +112,21 @@ def scale_to_uint8(arr: np.ndarray, lo: float, hi: float, gamma: float) -> np.nd
     a = arr.astype(np.float64, copy=False)
     a = (a - lo) / max(hi - lo, 1e-12)
     a = np.clip(a, 0.0, 1.0)
-    if gamma and gamma != 1.0: a = np.power(a, gamma)
+    if gamma and gamma != 1.0:
+        a = np.power(a, gamma)
     return (a * 255.0 + 0.5).astype(np.uint8)
 
 def scale_to_uint16(arr: np.ndarray, method: str, lo: float, hi: float, gamma: float) -> np.ndarray:
     if method == "absolute16":
+        # fixed mapping; ignore gamma
         return np.clip(arr, 0.0, 65535.0).astype(np.uint16)
     a = arr.astype(np.float64, copy=False)
     a = (a - lo) / max(hi - lo, 1e-12)
     a = np.clip(a, 0.0, 1.0)
-    if gamma and gamma != 1.0: a = np.power(a, gamma)
+    if gamma and gamma != 1.0:
+        a = np.power(a, gamma)
     return (a * 65535.0 + 0.5).astype(np.uint16)
+
 
 # ------------------------- Global range (optional) ---------------------
 
@@ -108,6 +134,7 @@ def estimate_global_lo_hi(sem_paths: List[Path],
                           clip_percent: float,
                           sample_per_tile: int = 5000,
                           seed: int = 0) -> Tuple[float, float]:
+    """Sample pixels across tiles and compute robust global lo/hi by percentiles."""
     rng = np.random.default_rng(seed)
     samples: List[np.ndarray] = []
     for p in sem_paths:
@@ -133,24 +160,50 @@ def estimate_global_lo_hi(sem_paths: List[Path],
         lo, hi = 0.0, 1.0
     return float(lo), float(hi)
 
+
 # ----------------------- TileConfiguration.txt -------------------------
 
 def write_tileconfig(out_path: Path, entries: List[Tuple[str, float, float]]) -> None:
-    lines = ["# Define the number of dimensions we are working on",
-             "dim = 2", "", "# Define the image coordinates"]
+    lines = [
+        "# Define the number of dimensions we are working on",
+        "dim = 2",
+        "",
+        "# Define the image coordinates",
+    ]
     lines += [f"{name}; ; ({x:.3f}, {y:.3f})" for name, x, y in entries]
     out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+# ----------------------------- Grid helpers ----------------------------
+
+def robust_pitch(vals_um: np.ndarray) -> float:
+    """Estimate the dominant pitch from stage positions using NN differences."""
+    v = np.sort(np.asarray(vals_um, float))
+    d = np.diff(v)
+    d = d[d > 1e-3]  # drop zeros/duplicates
+    if d.size == 0:
+        return 1.0
+    lo, hi = np.percentile(d, [5, 95])
+    band = d[(d >= lo) & (d <= hi)]
+    hist, edges = np.histogram(band, bins=60)
+    peak = 0.5 * (edges[np.argmax(hist)] + edges[np.argmax(hist) + 1])
+    mask = (d > 0.8 * peak) & (d < 1.2 * peak)
+    pitch = float(np.median(d[mask])) if np.any(mask) else float(np.median(d))
+    return max(pitch, 1e-6)
+
 
 # --------------------------------- CLI ---------------------------------
 
 def main(argv: List[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description="Convert SEM NPZ to tiles and build TileConfiguration.txt (+ audit + dedup)")
+    p = argparse.ArgumentParser(
+        description="Convert SEM NPZ to tiles and build TileConfiguration.txt (+ audit + dedup)")
     p.add_argument("--sem-folder", required=True, type=Path)
     p.add_argument("--metadata-folder", required=True, type=Path)
     p.add_argument("--outdir", type=Path, default=Path("processeddata"))
     p.add_argument("--tiles-subdir", type=str, default="sem-images-png")
     p.add_argument("--tileconfig-name", type=str, default="TileConfiguration.txt")
     p.add_argument("--glob", type=str, default="*_sem.npz")
+
     # tiles + normalization
     p.add_argument("--out-format", choices=["png8", "tiff16"], default="png8")
     p.add_argument("--norm", choices=["auto", "absolute", "absolute16", "fixed", "global"], default="auto")
@@ -159,12 +212,18 @@ def main(argv: List[str] | None = None) -> int:
     p.add_argument("--auto-clip-percent", type=float, default=0.0)
     p.add_argument("--gamma", type=float, default=1.0)
     p.add_argument("--global-sample-per-tile", type=int, default=5000)
+
     # mapping
     p.add_argument("--um-per-px", type=float, default=0.5490099)
     p.add_argument("--auto-um-per-px", action="store_true")
     p.add_argument("--invert-x", action="store_true")
     p.add_argument("--invert-y", action="store_true")
-    # duplicates
+
+    # grid inference / duplicates
+    p.add_argument("--grid-size", type=str,
+                   help="Optional override: COLSxROWS (e.g., 19x26) to define pitch from extents.")
+    p.add_argument("--index-epsilon-frac", type=float, default=0.25,
+                   help="Tolerance as fraction of step when snapping to grid.")
     p.add_argument("--dup-policy", choices=["keep", "first", "last", "closest"], default="keep",
                    help="How to resolve duplicate grid cells.")
     args = p.parse_args(argv)
@@ -182,8 +241,8 @@ def main(argv: List[str] | None = None) -> int:
     print(f"[INFO] Found {len(sem_paths)} SEM file(s). out={args.out_format}, norm={args.norm}, "
           f"gamma={args.gamma}, clip={args.auto_clip_percent}")
 
-    # global normalization pre-pass
-    global_lo_hi: Tuple[float, float] | None = None
+    # ---- global normalization pre-pass
+    global_lo_hi: Optional[Tuple[float, float]] = None
     if args.norm == "global":
         glo, ghi = estimate_global_lo_hi(sem_paths, args.auto_clip_percent,
                                          sample_per_tile=args.global_sample_per_tile, seed=0)
@@ -198,7 +257,7 @@ def main(argv: List[str] | None = None) -> int:
     step_um_y_candidates: List[float] = []
     records: List[Tuple[str, float, float]] = []  # (tile_name, x_um, y_um)
 
-    # export loop
+    # ---- tile export loop
     for i, sem_path in enumerate(sem_paths, 1):
         base_full = sem_path.stem
         base = base_full[:-4] if base_full.endswith("_sem") else base_full
@@ -233,7 +292,8 @@ def main(argv: List[str] | None = None) -> int:
         meta_path = meta_dir / f"{base}_metadata.txt"
         if not meta_path.exists():
             alt = sem_path.with_name(f"{base}_metadata.txt")
-            if alt.exists(): meta_path = alt
+            if alt.exists():
+                meta_path = alt
         meta = parse_metadata_txt(meta_path) if meta_path.exists() else {}
 
         x_mm = meta_num(meta, "Stage Position/X")
@@ -254,16 +314,14 @@ def main(argv: List[str] | None = None) -> int:
         print("[WARN] No records with valid stage positions; TileConfiguration.txt will not be written.", file=sys.stderr)
         return 0
 
-    # µm/px selection
+    # ---- µm/px selection
     um_per_px = args.um_per_px
     if args.auto_um_per_px:
         umppx_candidates = []
         if step_um_x_candidates and tile_sizes:
-            w_px = int(np.median([w for w, _ in tile_sizes]))
-            umppx_candidates.append(np.median(step_um_x_candidates) / max(w_px, 1))
+            w_px = int(np.median([w for w, _ in tile_sizes])); umppx_candidates.append(np.median(step_um_x_candidates) / max(w_px, 1))
         if step_um_y_candidates and tile_sizes:
-            h_px = int(np.median([h for _, h in tile_sizes]))
-            umppx_candidates.append(np.median(step_um_y_candidates) / max(h_px, 1))
+            h_px = int(np.median([h for _, h in tile_sizes])); umppx_candidates.append(np.median(step_um_y_candidates) / max(h_px, 1))
         if umppx_candidates:
             um_per_px = float(np.median(umppx_candidates))
             print(f"[INFO] --auto-um-per-px → {um_per_px:.6f} µm/px (from X/Y Step & tile size)")
@@ -272,7 +330,7 @@ def main(argv: List[str] | None = None) -> int:
     else:
         print(f"[INFO] Using manual --um-per-px = {um_per_px}")
 
-    # coords → pixels
+    # ---- coords (µm) with flips + zero min
     names, xs_um, ys_um = zip(*records)
     names = list(names)
     xs = np.array(xs_um, dtype=float)
@@ -280,21 +338,51 @@ def main(argv: List[str] | None = None) -> int:
     if args.invert_x: xs = -xs
     if args.invert_y: ys = -ys
     xs -= xs.min(); ys -= ys.min()
-    xs_px = xs / um_per_px; ys_px = ys / um_per_px
 
-    # infer grid indices (for audit & dedup)
+    # ---- grid pitch & indices (stage-only)
+    if args.grid_size:
+        try:
+            cols, rows = map(int, args.grid_size.lower().split("x"))
+            cols, rows = max(cols, 1), max(rows, 1)
+            step_um_x = (xs.max() - xs.min()) / max(cols - 1, 1)
+            step_um_y = (ys.max() - ys.min()) / max(rows - 1, 1)
+            source = "grid-size"
+        except Exception:
+            print("[WARN] --grid-size must be like 19x26; falling back to auto.", file=sys.stderr)
+            step_um_x = robust_pitch(xs); step_um_y = robust_pitch(ys); source = "auto"
+    else:
+        step_um_x = robust_pitch(xs)
+        step_um_y = robust_pitch(ys)
+        # inferred cols/rows for info
+        cols = int(round((xs.max() - xs.min()) / step_um_x)) + 1
+        rows = int(round((ys.max() - ys.min()) / step_um_y)) + 1
+        source = "auto"
+
+    eps_x = max(args.index_epsilon_frac * step_um_x, 1e-9)
+    eps_y = max(args.index_epsilon_frac * step_um_y, 1e-9)
+    ix = np.rint(xs / step_um_x).astype(int)
+    iy = np.rint(ys / step_um_y).astype(int)
+    off = (np.abs(xs - ix * step_um_x) > eps_x) | (np.abs(ys - iy * step_um_y) > eps_y)
+    n_off = int(np.count_nonzero(off))
+    if n_off:
+        print(f"[NOTE] {n_off} tiles sit > {args.index_epsilon_frac:.2f}·step from cell centers (indexing={source})")
+
+    # overlap estimate (for sanity)
     w_px_m = int(np.median([w for w, _ in tile_sizes])) if tile_sizes else 0
     h_px_m = int(np.median([h for _, h in tile_sizes])) if tile_sizes else 0
-    step_um_x = (np.median(step_um_x_candidates) if step_um_x_candidates else w_px_m * um_per_px)
-    step_um_y = (np.median(step_um_y_candidates) if step_um_y_candidates else h_px_m * um_per_px)
+    tile_um_w = w_px_m * um_per_px if w_px_m else float("nan")
+    tile_um_h = h_px_m * um_per_px if h_px_m else float("nan")
+    ov_x = max(0.0, 1.0 - step_um_x / tile_um_w) if np.isfinite(tile_um_w) and tile_um_w > 0 else float("nan")
+    ov_y = max(0.0, 1.0 - step_um_y / tile_um_h) if np.isfinite(tile_um_h) and tile_um_h > 0 else float("nan")
+    print(f"[INFO] inferred grid ≈ {cols}×{rows} (indexing={source}), step_um=({step_um_x:.3f},{step_um_y:.3f}), "
+          f"overlap≈({ov_x*100:.1f}%,{ov_y*100:.1f}%)")
 
-    ix = np.rint(xs / max(step_um_x, 1e-9)).astype(int)
-    iy = np.rint(ys / max(step_um_y, 1e-9)).astype(int)
+    # occupancy map
     occ: Dict[Tuple[int, int], List[int]] = {}
     for k in range(len(names)):
-        occ.setdefault((ix[k], iy[k]), []).append(k)
+        occ.setdefault((int(ix[k]), int(iy[k])), []).append(k)
 
-    # -------- DEDUP (optional) --------
+    # ---- DEDUP (optional)
     dropped_records: List[str] = []
     if args.dup_policy != "keep":
         keep_mask = np.zeros(len(names), dtype=bool)
@@ -306,10 +394,9 @@ def main(argv: List[str] | None = None) -> int:
                 chosen = min(idxs)
             elif args.dup_policy == "last":
                 chosen = max(idxs)
-            else:  # closest
+            else:  # closest to cell center
                 cx, cy = cell
-                cx_um = cx * step_um_x
-                cy_um = cy * step_um_y
+                cx_um, cy_um = cx * step_um_x, cy * step_um_y
                 d2 = [((xs[i] - cx_um) ** 2 + (ys[i] - cy_um) ** 2, i) for i in idxs]
                 chosen = min(d2)[1]
             keep_mask[chosen] = True
@@ -321,13 +408,14 @@ def main(argv: List[str] | None = None) -> int:
         # filter arrays
         names = [nm for (nm, m) in zip(names, keep_mask) if m]
         xs = xs[keep_mask]; ys = ys[keep_mask]
-        xs_px = xs_px[keep_mask]; ys_px = ys_px[keep_mask]
         ix = ix[keep_mask]; iy = iy[keep_mask]
-        # write dedup report
+        # write report
         (tiles_dir / "duplicates_resolved.txt").write_text("\n".join(dropped_records) + "\n", encoding="utf-8")
 
-    # entries (sorted by y then x)
-    order = np.lexsort((xs_px, ys_px))
+    # pixel coordinates for Fiji
+    xs_px = xs / um_per_px
+    ys_px = ys / um_per_px
+    order = np.lexsort((xs_px, ys_px))  # sort by y then x
     entries = [(names[i], float(xs_px[i]), float(ys_px[i])) for i in order]
 
     tile_path = tiles_dir / args.tileconfig_name
@@ -341,24 +429,22 @@ def main(argv: List[str] | None = None) -> int:
     ncols = max_ix - min_ix + 1
     nrows = max_iy - min_iy + 1
     expected_order = [(i, j) for j in range(min_iy, max_iy + 1) for i in range(min_ix, max_ix + 1)]
-    present = {(int(a), int(b)) for a, b in zip(ix, iy)}
-
-    # recompute occ after dedup (for audit display)
     occ_audit: Dict[Tuple[int, int], List[int]] = {}
     for k in range(len(names)):
         occ_audit.setdefault((int(ix[k]), int(iy[k])), []).append(k)
+    present = set(occ_audit.keys())
     missing_cells = [c for c in expected_order if c not in present]
     duplicates_now = [(cell, idxs) for cell, idxs in occ_audit.items() if len(idxs) > 1]
 
     audit_lines: List[str] = []
     audit_lines.append(f"Tiles written: {len(all_tile_names)}")
     audit_lines.append(f"Tiles in TileConfiguration (after dedup): {len(names)}")
-    audit_lines.append(f"Grid inference:")
+    audit_lines.append("Grid inference:")
     audit_lines.append(f"  step_um ~ ({step_um_x:.3f}, {step_um_y:.3f}), tile_px ~ ({w_px_m},{h_px_m})")
     audit_lines.append(f"  grid cols×rows ~ {ncols}×{nrows} → expected {ncols*nrows} cells")
     audit_lines.append(f"  present {len(present)}, missing {len(missing_cells)}, duplicates {len(duplicates_now)}")
 
-    def cell_name(cell: Tuple[int,int]) -> str | None:
+    def cell_name(cell: Tuple[int, int]) -> Optional[str]:
         idxs = occ_audit.get(cell)
         return names[idxs[0]] if idxs else None
 
@@ -382,11 +468,10 @@ def main(argv: List[str] | None = None) -> int:
                 f"between: prev={prev_name or '—'}, next={next_name or '—'}"
             )
 
-    if args.dup_policy == "keep" and any(len(v) > 1 for v in occ_audit.values()):
+    if duplicates_now:
         audit_lines.append("Duplicate cells (grid index → tiles):")
-        for (cell, idxs) in list(occ_audit.items())[:10]:
-            if len(idxs) > 1:
-                audit_lines.append(f"  {cell}: " + ", ".join(names[i] for i in idxs))
+        for (cell, idxs) in duplicates_now[:10]:
+            audit_lines.append(f"  {cell}: " + ", ".join(names[i] for i in idxs))
 
     print("\n[Tile audit]")
     for line in audit_lines[:12]:
@@ -395,7 +480,7 @@ def main(argv: List[str] | None = None) -> int:
         print("  … see full report in tiles_audit.txt")
     (tiles_dir / "tiles_audit.txt").write_text("\n".join(audit_lines) + "\n", encoding="utf-8")
 
-    # Corner sanity
+    # ---------------------- Corner sanity ----------------------
     xn = xs / (xs.max() if xs.max() > 0 else 1.0)
     yn = ys / (ys.max() if ys.max() > 0 else 1.0)
     tl = int(np.argmin(xn + yn))
@@ -408,6 +493,7 @@ def main(argv: List[str] | None = None) -> int:
     print(f"  bottom-left  : {names[bl]}")
     print(f"  bottom-right : {names[br]}")
     return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())

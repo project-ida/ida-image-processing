@@ -2,7 +2,7 @@
 """
 Step 2 — SEM image → tiles + Fiji TileConfiguration.txt
 
-Adds:
+Features:
 - TileConfiguration.txt is written into the *tiles folder*
 - --auto-um-per-px : compute µm/px from metadata (X/Y Step) + image size
 - --out-format     : png8 or tiff16 (16-bit preserves dynamic range)
@@ -11,14 +11,17 @@ Adds:
 - Per-tile print of normalization values actually applied
 - Corner sanity print (which files wind up at TL/TR/BL/BR)
 
-Notes:
-- Fiji: when you generate the layout with the flags here, leave
+Fiji note:
+- When you generate the layout with the flags here, leave
   “Invert X/Y coordinates” *unchecked* in the stitching dialog.
 """
 
 from __future__ import annotations
-import argparse, sys, re
+import argparse
+import sys
+import re
 from pathlib import Path
+
 import numpy as np
 from PIL import Image
 
@@ -76,7 +79,8 @@ def compute_lo_hi(arr: np.ndarray, method: str,
         lo, hi = 0.0, 65535.0
     elif method == "absolute":
         if np.issubdtype(arr.dtype, np.integer):
-            info = np.iinfo(arr.dtype); lo, hi = float(info.min), float(info.max)
+            info = np.iinfo(arr.dtype)
+            lo, hi = float(info.min), float(info.max)
         else:
             lo, hi = float(np.nanmin(a)), float(np.nanmax(a))
     else:
@@ -133,9 +137,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--tiles-subdir", type=str, default="sem-images-png", help="Subfolder (under outdir) for tiles.")
     p.add_argument("--tileconfig-name", type=str, default="TileConfiguration.txt", help="Name for the Fiji layout file.")
     p.add_argument("--glob", type=str, default="*_sem.npz", help="Glob for SEM files.")
-    # normalization
-    p.add_argument("--out-format", choices=["png8","tiff16"], default="png8", help="Tile image format.")
-    p.add_argument("--norm", choices=["auto","absolute","absolute16","fixed"], default="auto", help="Intensity normalization.")
+    # tile image format + normalization
+    p.add_argument("--out-format", choices=["png8", "tiff16"], default="png8", help="Tile image format.")
+    p.add_argument("--norm", choices=["auto", "absolute", "absolute16", "fixed"], default="auto", help="Intensity normalization.")
     p.add_argument("--vmin", type=float, default=None, help="Used if --norm fixed.")
     p.add_argument("--vmax", type=float, default=None, help="Used if --norm fixed.")
     p.add_argument("--auto-clip-percent", type=float, default=0.0,
@@ -161,7 +165,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[WARN] No SEM files found in {sem_dir} with pattern {args.glob}", file=sys.stderr)
         return 1
 
-    print(f"[INFO] Found {len(files)} SEM file(s). out={args.out_format}, norm={args.norm}, gamma={args.gamma}, auto-clip={args.auto_clip_percent}")
+    print(f"[INFO] Found {len(files)} SEM file(s). out={args.out_format}, norm={args.norm}, "
+          f"gamma={args.gamma}, auto-clip={args.auto_clip_percent}")
 
     records = []      # (basename, x_um, y_um)
     umppx_x_vals = [] # from X Step / width
@@ -262,11 +267,14 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[OK] Wrote {tile_path} with {len(entries)} entries")
     print("     Open this file in Fiji from the same folder; leave 'Invert X/Y' unchecked.")
 
-    # Corner sanity
-    tl = int(np.argmin(xs + ys))
-    tr = int(np.argmin((-xs) + ys))
-    bl = int(np.argmin(xs + (-ys)))
-    br = int(np.argmax(xs + ys))
+    # Corner sanity (after flips + normalization)
+    # Normalize to 0..1 for a balanced "closest corner" test
+    xn = xs / (xs.max() if xs.max() > 0 else 1.0)
+    yn = ys / (ys.max() if ys.max() > 0 else 1.0)
+    tl = int(np.argmin(xn + yn))
+    tr = int(np.argmin((1 - xn) + yn))
+    bl = int(np.argmin(xn + (1 - yn)))
+    br = int(np.argmin((1 - xn) + (1 - yn)))
     print("\n[Corner sanity]")
     print(f"  top-left     : {names[tl]}")
     print(f"  top-right    : {names[tr]}")

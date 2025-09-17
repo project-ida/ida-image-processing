@@ -17,13 +17,13 @@ What it does
 ------------
 1) Converts each SEM NPZ to an 8-bit PNG (grayscale).
    Normalization options:
-     - auto   : per-image min..max
-     - absolute16 : 0..65535 → 0..255
-     - absolute   : 0..<dtype max> → 0..255
-     - fixed  : use --vmin/--vmax
+     - auto        : per-image min..max
+     - absolute16  : 0..65535 → 0..255
+     - absolute    : 0..<dtype max> → 0..255
+     - fixed       : use --vmin/--vmax
 2) Builds a Fiji "TileConfiguration.txt" using stage positions:
    - Read stage X/Y (assumed mm → µm)
-   - Optionally invert X with --invert-x
+   - Optional flips with --invert-x / --invert-y (applied *before* normalization)
    - Subtract global mins so the top-left tile starts at (0,0)
    - Convert µm → px with --um-per-px (default 0.5490099 µm/px)
    - Writes pixel coordinates as floats
@@ -170,6 +170,7 @@ def main(argv: list[str] | None = None) -> int:
     # stage → pixel mapping
     p.add_argument("--um-per-px", type=float, default=0.5490099, help="Micrometers per pixel for SEM tiles (default: 0.5490099).")
     p.add_argument("--invert-x", action="store_true", help="Invert stage X before normalization (mirror around Y).")
+    p.add_argument("--invert-y", action="store_true", help="Invert stage Y before normalization (mirror around X).")
     args = p.parse_args(argv)
 
     sem_dir: Path = args.sem_folder
@@ -228,28 +229,32 @@ def main(argv: list[str] | None = None) -> int:
         print("[WARN] No records with valid stage positions; TileConfiguration.txt will not be written.", file=sys.stderr)
         return 0
 
-    # Second pass: normalize to (0,0), apply invert-x, convert µm → px
+    # Second pass: apply flips, normalize to (0,0), convert µm → px
     names, xs_um, ys_um = zip(*records)
     xs = np.array(xs_um, dtype=float)
     ys = np.array(ys_um, dtype=float)
 
+    # Apply flips (important: BEFORE zero-shift)
     if args.invert_x:
         xs = -xs
+    if args.invert_y:
+        ys = -ys
 
+    # Normalize origin to top-left in the chosen frame
     xs -= xs.min()
     ys -= ys.min()
 
     xs_px = xs / args.um_per_px
     ys_px = ys / args.um_per_px
 
-    # Build entries; sort by y then x (nice to look at, not required by Fiji)
+    # Build entries; sort by y then x (purely cosmetic)
     order = np.lexsort((xs_px, ys_px))
     entries = [(names[i], float(xs_px[i]), float(ys_px[i])) for i in order]
 
     tile_path = outdir / args.tileconfig_name
     write_tileconfig(tile_path, entries)
     print(f"[OK] Wrote {tile_path} with {len(entries)} entries")
-    print("     Put TileConfiguration.txt and 'sem-images-png' in the same folder when launching Fiji.")
+    print("     Open this from the same folder in Fiji (no Invert X/Y needed).")
     return 0
 
 if __name__ == "__main__":

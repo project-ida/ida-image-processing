@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
 """
-Step 2 — SEM image → tiles + Fiji TileConfiguration.txt (+ tile-audit)
+Step 2 — SEM image → tiles + Fiji TileConfiguration.txt (+ tile-audit with neighbors)
 
-New:
-- TileConfiguration.txt is written into the *tiles folder*
-- --out-format {png8,tiff16}, normalization knobs (--norm, --auto-clip-percent, --gamma)
-- --auto-um-per-px from metadata X/Y Step (median across tiles)
-- **Tile audit**: report skipped tiles (no metadata), missing grid cells, duplicates
-  → printed summary and full details in tiles_audit.txt
+Features
+--------
+- Writes TileConfiguration.txt **into the tiles folder** (same dir as images)
+- --out-format {png8,tiff16}  (16-bit TIFF preserves dynamic range)
+- --norm {auto,absolute16,absolute,fixed} (+ --vmin/--vmax for fixed)
+- --auto-clip-percent P  (if --norm auto, clip low/high Pth percentile)
+- --gamma g              (gamma<1 brightens; >1 darkens)
+- --invert-x / --invert-y (applied BEFORE normalization)
+- --auto-um-per-px       (median from X/Y Step in metadata / image size)
+- Per-tile print of normalization used (lo/hi, gamma)
+- **Tile audit**: skipped tiles, missing grid cells (with before/after filenames), duplicates
+- Corner sanity print (which files end up at TL/TR/BL/BR after transforms)
 
-Fiji note:
-- Generate layout here; in Fiji's stitching dialog leave "Invert X/Y coordinates" UNchecked.
+Fiji note
+---------
+Open TileConfiguration.txt from the tiles folder in Fiji and **leave**
+"Invert X/Y coordinates" **unchecked** if you used the flip flags here.
 """
 
 from __future__ import annotations
@@ -60,8 +68,7 @@ def load_sem_npz(npz_path: Path) -> np.ndarray:
     """Load 2D SEM image from NPZ (prefer 'sem_data', else first key)."""
     with np.load(npz_path) as z:
         key = "sem_data" if "sem_data" in z.files else (z.files[0] if z.files else None)
-        if key is None:
-            raise ValueError("empty NPZ")
+        if key is None: raise ValueError("empty NPZ")
         arr = z[key]
     if arr.ndim != 2:
         raise ValueError(f"{npz_path.name}: expected 2D array, got shape {arr.shape}")
@@ -218,7 +225,6 @@ def main(argv: List[str] | None = None) -> int:
     # choose µm/px
     um_per_px = args.um_per_px
     if args.auto_um_per_px:
-        # infer from X/Y Step (µm) divided by image size (px)
         umppx_candidates = []
         if step_um_x_candidates and tile_sizes:
             w_px = int(np.median([w for w, _ in tile_sizes]))
@@ -259,7 +265,6 @@ def main(argv: List[str] | None = None) -> int:
     audit_lines.append(f"Tiles in TileConfiguration (with stage positions): {len(names)}")
     if skipped_tiles:
         audit_lines.append(f"Skipped (no/invalid metadata): {len(skipped_tiles)}")
-        # show only first few inline; full list is in the file anyway
         preview = ', '.join(skipped_tiles[:10])
         audit_lines.append(f"  e.g. {preview}{' …' if len(skipped_tiles) > 10 else ''}")
     else:
@@ -282,23 +287,51 @@ def main(argv: List[str] | None = None) -> int:
     min_iy, max_iy = int(iy.min()), int(iy.max())
     ncols = max_ix - min_ix + 1
     nrows = max_iy - min_iy + 1
-    expected = {(i, j) for i in range(min_ix, max_ix + 1) for j in range(min_iy, max_iy + 1)}
+
+    # row-major expected order (y then x)
+    expected_order = [(i, j) for j in range(min_iy, max_iy + 1) for i in range(min_ix, max_ix + 1)]
     present = set(occ.keys())
-    missing_cells = sorted(expected - present)
+    missing_cells = [c for c in expected_order if c not in present]
     duplicates = [(cell, idxs) for cell, idxs in occ.items() if len(idxs) > 1]
 
-    audit_lines.append(f"Grid inference:")
+    audit_lines.append("Grid inference:")
     audit_lines.append(f"  step_um ~ ({step_um_x:.3f}, {step_um_y:.3f}), tile_px ~ ({w_px_m},{h_px_m})")
     audit_lines.append(f"  grid cols×rows ~ {ncols}×{nrows} → expected {ncols*nrows} cells")
     audit_lines.append(f"  present {len(present)}, missing {len(missing_cells)}, duplicates {len(duplicates)}")
 
+    # helper: primary name for a cell (first if duplicate)
+    def cell_name(cell: Tuple[int,int]) -> str | None:
+        idxs = occ.get(cell)
+        return names[idxs[0]] if idxs else None
+
     if missing_cells:
         audit_lines.append("Missing cells (first 20 shown):")
-        for (cx, cy) in missing_cells[:20]:
+        for cell in missing_cells[:20]:
+            cx, cy = cell
             x_um_miss = cx * step_um_x
             y_um_miss = cy * step_um_y
-            audit_lines.append(f"  cell ({cx},{cy}) ~ stage (µm)=({x_um_miss:.1f},{y_um_miss:.1f}) "
-                               f"~ pixel (px)=({x_um_miss/um_per_px:.1f},{y_um_miss/um_per_px:.1f})")
+            x_px_miss = x_um_miss / um_per_px
+            y_px_miss = y_um_miss / um_per_px
+            # find neighbors in expected_order
+            pos = expected_order.index(cell)
+            prev_name = None
+            for k in range(pos - 1, -1, -1):
+                nm = cell_name(expected_order[k])
+                if nm:
+                    prev_name = nm
+                    break
+            next_name = None
+            for k in range(pos + 1, len(expected_order)):
+                nm = cell_name(expected_order[k])
+                if nm:
+                    next_name = nm
+                    break
+            audit_lines.append(
+                f"  cell ({cx},{cy}) ~ stage (µm)=({x_um_miss:.1f},{y_um_miss:.1f}) "
+                f"~ pixel (px)=({x_px_miss:.1f},{y_px_miss:.1f})  "
+                f"between: prev={prev_name or '—'}, next={next_name or '—'}"
+            )
+
     if duplicates:
         audit_lines.append("Duplicate cells (grid index → tiles):")
         for (cell, idxs) in duplicates[:10]:
@@ -306,9 +339,9 @@ def main(argv: List[str] | None = None) -> int:
 
     # print short summary
     print("\n[Tile audit]")
-    for line in audit_lines[:10]:
+    for line in audit_lines[:12]:
         print(line)
-    if len(audit_lines) > 10:
+    if len(audit_lines) > 12:
         print("  … see full report in tiles_audit.txt")
 
     # write full report

@@ -220,7 +220,11 @@ def main():
     rows = read_summary_csv(csv_path)
 
     # after you loaded summary_table.csv into df (or however you build the list)
-    npz_paths = [str(p) for p in df["npz_path"].dropna().tolist() if os.path.isfile(p)]
+    npz_paths = [
+        r["npz_path"]
+        for r in rows
+        if r.get("npz_path") and os.path.isfile(r["npz_path"])
+    ]
     if not npz_paths:
         raise SystemExit("No NPZ files found via 'npz_path' column.")
   
@@ -379,7 +383,7 @@ def main():
         # norm == "none" (or unknown): full raw range
         return global_min, global_max
 
-    lo_used, hi_used = pick_lo_hi_from_norm(args, npz_paths, global_min, global_max)
+    lo_used, hi_used = pick_lo_hi_from_norm(args, npz_paths, g_min, g_max)
 
     # preview
     out_png = out_dir / f"{folder.name.replace(' ', '_')}_Z0_preview.png"

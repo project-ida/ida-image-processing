@@ -12,7 +12,7 @@ Examples:
   python stitch_h5data.py ./h5data --px_x_um 0.632324 --px_y_um 0.632324
 """
 
-import os, math, argparse, shutil
+import os, math, argparse, shutil, random
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -126,8 +126,33 @@ def fmt_output_range(fmt: str) -> tuple[float, float]:
         return 0.0, 65535.0
     if fmt == "short":
         return -32768.0, 32767.0
-    # fallback
     return 0.0, 255.0
+
+# ---- percentile helpers (no libvips percentiles; sample NPZs directly) ------
+
+def sample_npz_percentiles(dfz: pd.DataFrame, p_lo: float, p_hi: float,
+                           samples_per_tile: int = 20000,
+                           rng_seed: int = 0) -> tuple[float, float]:
+    """
+    Draw a small random sample per tile and compute percentiles in numpy.
+    Robust and independent of libvips build.
+    """
+    rng = np.random.default_rng(rng_seed)
+    acc = []
+    for pth in dfz["npz_path"]:
+        a = load_npz_sem(Path(pth))
+        if a is None or a.size == 0:
+            continue
+        a = a.ravel()
+        if samples_per_tile > 0 and a.size > samples_per_tile:
+            idx = rng.choice(a.size, samples_per_tile, replace=False)
+            a = a[idx]
+        acc.append(a.astype(np.float64, copy=False))
+    if not acc:
+        return 0.0, 1.0
+    x = np.concatenate(acc)
+    lo, hi = np.nanpercentile(x, [p_lo, 100.0 - p_lo]) if p_hi is None else np.nanpercentile(x, [p_lo, p_hi])
+    return float(lo), float(hi)
 
 # ----------------------------- main ------------------------------------------
 
@@ -154,6 +179,10 @@ def main():
                     help="For --norm auto: clip percent at both ends (e.g., 1.0 → p1/p99)")
     ap.add_argument("--lo", type=float, default=None, help="For --norm fixed: low clip (raw units)")
     ap.add_argument("--hi", type=float, default=None, help="For --norm fixed: high clip (raw units)")
+    # percentile sampling controls
+    ap.add_argument("--auto-samples-per-tile", type=int, default=20000,
+                    help="When --norm auto, how many pixels to sample per tile (0=all)")
+    ap.add_argument("--auto-rng-seed", type=int, default=0, help="RNG seed for auto sampling")
 
     args = ap.parse_args()
     os.environ["VIPS_CONCURRENCY"] = str(args.vips_workers)
@@ -173,8 +202,6 @@ def main():
     df = must_have_columns(pd.read_csv(csv_path))
     # resolve px sizes (µm/px)
     px_x_um, px_y_um = infer_px_um_from_df(df, args.px_x_um, args.px_y_um)
-    um_to_px_x = lambda um: um / px_x_um
-    um_to_px_y = lambda um: um / px_y_um
 
     # determine Z layers
     try:
@@ -185,8 +212,8 @@ def main():
     # canvas in native px, then apply scale
     x_max_um = float((df["X_rel_um"] + df.get("TileWidth_um", 0)).max())
     y_max_um = float((df["Y_rel_um"] + df.get("TileHeight_um", 0)).max())
-    Wn = int(math.ceil(um_to_px_x(x_max_um)))
-    Hn = int(math.ceil(um_to_px_y(y_max_um)))
+    Wn = int(math.ceil(x_max_um / px_x_um))
+    Hn = int(math.ceil(y_max_um / px_y_um))
     SCALE = float(args.scale)
     W = max(1, int(round(Wn * SCALE)))
     H = max(1, int(round(Hn * SCALE)))
@@ -215,10 +242,8 @@ def main():
             a = load_npz_sem(Path(pth))
             if a is None or a.size == 0:
                 continue
-            # dtype
             if probed_fmt is None:
                 _, probed_fmt = numpy_to_vips_gray(a)
-            # min/max
             amin = float(np.nanmin(a))
             amax = float(np.nanmax(a))
             if amin < global_min: global_min = amin
@@ -251,8 +276,7 @@ def main():
                     im = pyvips.Image.new_from_file(str(tiff_path), access="sequential")
                     s = min(1.0, args.preview_max / max(im.width, im.height))
                     prv = im.resize(s) if s < 1.0 else im
-                    # displayable 8-bit preview
-                    prv8 = _preview_from_vips(prv)
+                    prv8 = _preview_from_vips(prv, None, None)  # 8-bit display
                     prv8.pngsave(str(prev_path), compression=6)
                     print(f"✅ Preview (from existing): {prev_path}")
                 except Exception as e:
@@ -260,8 +284,11 @@ def main():
             continue
 
         # compose mosaic (weighted if feather > 0)
+        use_rgb = (args.channel == "rgb")
+        if args.feather-px if False else False:  # satisfy linter (will be overridden below)
+            pass
         if args.feather_px > 0:
-            if args.channel == "rgb":
+            if use_rgb:
                 acc  = pyvips.Image.black(W, H, bands=3).cast("float")
                 wacc = pyvips.Image.black(W, H).cast("float")
             else:
@@ -280,7 +307,7 @@ def main():
                     tile_v = tile_v.resize(SCALE, kernel="linear")
 
                 wm = feather_mask_vips(tile_v.width, tile_v.height, int(args.feather_px))
-                if args.channel == "rgb":
+                if use_rgb:
                     tile_v = replicate(tile_v, 3)
                     acc    = acc.insert(tile_v * replicate(wm, 3), x0, y0)
                 else:
@@ -288,14 +315,14 @@ def main():
                 wacc = wacc.insert(wm, x0, y0)
 
             eps = 1e-6
-            if args.channel == "rgb":
+            if use_rgb:
                 w3   = replicate(wacc + eps, 3)
                 mosaic = (acc / w3)
             else:
                 mosaic = (acc / (wacc + eps))
 
             # holes to background
-            if args.channel == "rgb":
+            if use_rgb:
                 bg = (pyvips.Image.black(W, H, bands=3) + [bgval_dtype]*3).cast(probed_fmt)
                 mosaic = (wacc > 0).ifthenelse(mosaic.cast(probed_fmt), bg)
             else:
@@ -304,7 +331,7 @@ def main():
 
         else:
             # fast insert path
-            if args.channel == "rgb":
+            if use_rgb:
                 mosaic = (pyvips.Image.black(W, H, bands=3).cast(probed_fmt)
                           .copy(interpretation="srgb")) + [bgval_dtype]*3
             else:
@@ -320,42 +347,39 @@ def main():
                 tile_v, tfmt = numpy_to_vips_gray(a)
                 if SCALE != 1.0:
                     tile_v = tile_v.resize(SCALE, kernel="linear")
-                if args.channel == "rgb":
+                if use_rgb:
                     mosaic = mosaic.insert(replicate(tile_v, 3), x0, y0)
                 else:
                     mosaic = mosaic.insert(tile_v, x0, y0)
 
         # ---------------- Normalization (optional) ----------------
         # Apply to the *mosaic* so the whole image uses a consistent mapping.
-        def apply_norm(vimg: pyvips.Image) -> pyvips.Image:
-            if args.norm == "none":
-                return vimg
+        lo_used = None
+        hi_used = None
 
+        if args.norm == "fixed":
+            if args.lo is None or args.hi is None or args.hi <= args.lo:
+                raise SystemExit("--norm fixed requires valid --lo <v> and --hi <v> (hi>lo).")
+            lo_used, hi_used = float(args.lo), float(args.hi)
+
+        elif args.norm == "auto":
+            p = float(args.clip_percent)
+            lo_used, hi_used = sample_npz_percentiles(
+                dfz, p_lo=p, p_hi=100.0 - p, samples_per_tile=args.auto_samples_per_tile, rng_seed=args.auto_rng_seed
+            )
+            # sanity fallback
+            if not np.isfinite(lo_used) or not np.isfinite(hi_used) or hi_used <= lo_used:
+                lo_used, hi_used = global_min, global_max
+
+        # apply mapping if requested
+        if lo_used is not None and hi_used is not None:
             out_min, out_max = fmt_output_range(probed_fmt)
-            if args.norm == "fixed":
-                if args.lo is None or args.hi is None or args.hi <= args.lo:
-                    raise SystemExit("--norm fixed requires valid --lo <v> and --hi <v> (hi>lo).")
-                lo, hi = float(args.lo), float(args.hi)
-            elif args.norm == "auto":
-                p = float(args.clip_percent)
-                # percentiles from the mosaic (libvips computes efficiently)
-                lo = float(vimg.percentiles(p))
-                hi = float(vimg.percentiles(100.0 - p))
-                if hi <= lo:
-                    lo, hi = global_min, global_max
-            else:
-                return vimg
-
-            # (img - lo) * (out_range/(hi-lo)) + out_min, then cast to fmt
-            scale  = (out_max - out_min) / max(hi - lo, 1e-6)
-            vimg_n = ((vimg - lo) * scale + out_min).cast(probed_fmt)
-            return vimg_n
-
-        mosaic = apply_norm(mosaic)
+            scale  = (out_max - out_min) / max(hi_used - lo_used, 1e-6)
+            mosaic = ((mosaic - lo_used) * scale + out_min).cast(probed_fmt)
 
         # save pyramidal BigTIFF
         try:
-            mosaic = mosaic.copy(interpretation="srgb" if args.channel == "rgb" else "b-w")
+            mosaic = mosaic.copy(interpretation="srgb" if use_rgb else "b-w")
         except Exception:
             pass
 
@@ -370,10 +394,18 @@ def main():
         print(f"✅ BigTIFF written: {tiff_path}")
 
         # --- Preview PNG (always 8-bit for display) ---
-        # derive from the *normalized* mosaic so it matches output look
         s = min(1.0, args.preview_max / max(W, H))
         prv = mosaic.resize(s) if s < 1.0 else mosaic
-        prv8 = _preview_from_vips(prv)  # robust 8-bit mapping for viewing
+        # For preview, reuse chosen lo/hi if we normalized; else compute from NPZ samples
+        if lo_used is None or hi_used is None:
+            plo = min(1.0, args.clip_percent)
+            lo_prev, hi_prev = sample_npz_percentiles(
+                dfz, p_lo=plo, p_hi=100.0 - plo, samples_per_tile=min(5000, args.auto_samples_per_tile), rng_seed=args.auto_rng_seed
+            )
+        else:
+            lo_prev, hi_prev = lo_used, hi_used
+
+        prv8 = _preview_from_vips(prv, lo_prev, hi_prev)  # 8-bit display
         prv8.pngsave(str(prev_path), compression=6)
         print(f"✅ Preview PNG:   {prev_path}")
 
@@ -381,22 +413,18 @@ def main():
 
 # ---------- preview helper (8-bit display mapping, robust) --------------------
 
-def _preview_from_vips(vimg: pyvips.Image, p_lo=1.0, p_hi=99.0) -> pyvips.Image:
+def _preview_from_vips(vimg: pyvips.Image, lo: float | None, hi: float | None) -> pyvips.Image:
     """
-    Return an 8-bit display image using robust percentile clipping.
-    Works for uchar/ushort/short inputs; preserves bands.
+    Return an 8-bit display image.
+    If lo/hi provided, use them; else use vimg min/max.
     """
-    # compute percentiles on a single band (monochrome mosaic)
-    try:
-        lo = float(vimg.percentiles(p_lo))
-        hi = float(vimg.percentiles(p_hi))
-    except Exception:
-        # fallback: min/max if percentiles unsupported
-        lo = float(vimg.min())
-        hi = float(vimg.max())
-    if hi <= lo:
-        hi = lo + 1.0
-    scaled = ((vimg - lo) * (255.0 / (hi - lo))).cast("uchar")
+    if lo is None or hi is None or not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        try:
+            lo = float(vimg.min())
+            hi = float(vimg.max())
+        except Exception:
+            lo, hi = 0.0, 1.0
+    scaled = ((vimg - lo) * (255.0 / max(hi - lo, 1e-6))).cast("uchar")
     if scaled.bands == 1:
         return scaled.copy(interpretation="b-w")
     return scaled.copy(interpretation="srgb")

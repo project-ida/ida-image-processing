@@ -138,8 +138,8 @@ def percentiles_from_samples(samples: np.ndarray, lo_p: float, hi_p: float):
 
 def scale_to_u8(arr16: np.ndarray, lo: float, hi: float, gamma: float = 1.0) -> np.ndarray:
     """
-    Clip ushort array to [lo, hi] then map to uint8.
-    gamma is applied after normalization (power-law).
+    Clip ushort array to [lo, hi], normalize to 0..1, then apply gamma *darkening*
+    for gamma>1 (standard convention). Finally map to uint8.
     """
     a = arr16.astype(np.float32)
     if hi <= lo:
@@ -147,7 +147,7 @@ def scale_to_u8(arr16: np.ndarray, lo: float, hi: float, gamma: float = 1.0) -> 
     a = np.clip(a, lo, hi)
     a = (a - lo) / (hi - lo)
     if gamma and abs(gamma - 1.0) > 1e-6:
-        a = np.power(a, 1.0 / float(gamma))
+        a = np.power(a, float(gamma))   # <-- was 1.0/gamma
     a = (a * 255.0 + 0.5).astype(np.uint8)
     return a
 

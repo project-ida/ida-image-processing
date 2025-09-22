@@ -18,6 +18,74 @@ import pyvips                         # noqa: E402
 # Optional plotting (import lazily later if not requested)
 plt = None
 
+# --- add near the top, next to other helpers ---
+def open_native(tif_path: Path) -> pyvips.Image:
+    """Open BigTIFF with random access, no type or colour changes."""
+    return pyvips.Image.new_from_file(str(tif_path), access="random", page=0)
+
+_VIPS2NP = {
+    "uchar":  "uint8",  "char":   "int8",
+    "ushort": "uint16", "short":  "int16",
+    "uint":   "uint32", "int":    "int32",
+    "float":  "float32","double": "float64",
+}
+
+def _vips_to_numpy(img: pyvips.Image):
+    import numpy as np
+    fmt = img.format
+    if fmt not in _VIPS2NP:
+        img = img.cast("float")
+        dt = np.float32
+    else:
+        dt = np.dtype(_VIPS2NP[fmt])
+    buf = img.write_to_memory()
+    return np.ndarray(buffer=buf, dtype=dt, shape=(img.height, img.width, img.bands))
+
+def plot_native_hist(img_native: pyvips.Image, title: str, logy: bool = True) -> bool:
+    """
+    Plot histogram in the image's *native* domain.
+    Returns True if a native-domain plot was shown, else False (caller may fallback).
+    - For integer images, uses vips.hist_find() (streaming; no full read).
+    - Special-case 'ushort' (common for SEM): x-axis = 0..65535.
+    """
+    # single band for brightness
+    band0 = img_native.extract_band(0) if img_native.bands > 1 else img_native
+
+    # only do native hist for integer types; float histograms can be misleading without binning
+    if band0.format not in ("uchar","char","ushort","short","uint","int"):
+        return False
+
+    h = band0.hist_find()  # integer-domain histogram; width == number of representable values
+    counts = _vips_to_numpy(h).reshape(-1)
+
+    import matplotlib.pyplot as plt
+    xs = None
+    if band0.format == "ushort":
+        xs = list(range(0, counts.size))            # 0..65535
+        xlab = "Value (0..65535)"
+    elif band0.format == "uchar":
+        xs = list(range(0, counts.size))            # 0..255
+        xlab = "Value (0..255)"
+    else:
+        # Signed / other integer: annotate with observed min/max
+        try:
+            vmin, vmax = int(band0.min()), int(band0.max())
+        except Exception:
+            vmin, vmax = 0, counts.size - 1
+        xs = list(range(0, counts.size))
+        xlab = f"Value index (observed ~{vmin}..{vmax})"
+
+    plt.figure(figsize=(8, 3.5))
+    plt.bar(xs, counts, width=1.0)
+    if logy:
+        plt.yscale("log")
+    plt.title(title)
+    plt.xlabel(xlab)
+    plt.ylabel("Count" + (" (log)" if logy else ""))
+    plt.tight_layout()
+    plt.show()
+    return True
+
 # ---------- progress-enabled dzsave ----------
 def _safe_disconnect(img, handle):
     for name in ("signal_disconnect", "disconnect"):
@@ -195,18 +263,24 @@ def main():
         zlabel = m.group(1) if m else tif.stem
 
         # Open + coerce to 8-bit, set interpretation
-        img8 = open_as_u8(tif)
-
-        # quick min/max
+        # inside: for tif in tifs:
+        img_native = open_native(tif)     # <-- NEW: native read (no coercion)
+        img8       = open_as_u8(tif)      # existing: u8 view used for dzsave
+        
+        # quick min/max on native (helpful to see true domain)
         try:
-            mn, mx = img8.min(), img8.max()
-            print(f"{tif.name}: range {mn}..{mx}, bands={img8.bands}, {img8.width}×{img8.height}")
+            nmin, nmax = int(img_native.min()), int(img_native.max())
+            print(f"{tif.name}: native range {nmin}..{nmax} ({img_native.format}), "
+                  f"bands={img_native.bands}, {img_native.width}×{img_native.height}")
         except Exception:
             pass
-
-        # --- optional histogram at input stage (as seen by pipeline) ---
+        
+        # --- INPUT histogram: native domain if possible; else fallback to u8 view ---
         if args.show_hist:
-            plot_u8_hist(img8, title=f"[INPUT] {tif.name} (u8 view)", logy=bool(args.hist_logy))
+            shown = plot_native_hist(img_native, title=f"[INPUT/native] {tif.name}", logy=bool(args.hist_logy))
+            if not shown:
+                # fallback: show the u8 coerced view if native is non-integer
+                plot_u8_hist(img8, title=f"[INPUT/u8 view] {tif.name}", logy=bool(args.hist_logy))
 
         wrote_any = False
 

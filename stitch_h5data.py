@@ -142,7 +142,8 @@ def apply_norm(img: pyvips.Image, fmt: str,
     absolute16 requests forcing to ushort.
     """
     in_lo, in_hi = fmt_range(fmt)
-    # decide lo/hi
+
+    # pick lo/hi
     if mode == "none":
         lo_used, hi_used = in_lo, in_hi
     elif mode == "fixed":
@@ -154,28 +155,31 @@ def apply_norm(img: pyvips.Image, fmt: str,
         fmt = "ushort"
     elif mode == "absolute":
         lo_used, hi_used = in_lo, in_hi
-    elif mode == "auto":
-        p = max(0.0, float(clip_percent))
-        lo_used, hi_used = sample_npz_percentiles(dfz, p, None, per_tile, seed)
-    elif mode == "global":
+    elif mode in ("auto", "global"):
         p = max(0.0, float(clip_percent))
         lo_used, hi_used = sample_npz_percentiles(dfz, p, None, per_tile, seed)
     else:
         raise SystemExit(f"Unknown --norm '{mode}'")
 
-    # scale → 0..1, gamma, then back to fmt range (or force ushort)
-    num = (img - lo_used) * (1.0 / max(hi_used - lo_used, 1e-6))
-    num = num.min(1.0).max(0.0)
+    # normalize to 0..1
+    scale = 1.0 / max(hi_used - lo_used, 1e-6)
+    num = (img - lo_used) * scale
 
+    # clamp to [0, 1] using vips masks
+    num = (num < 0).ifthenelse(0.0, num)
+    num = (num > 1).ifthenelse(1.0, num)
+
+    # gamma (optional)
     if gamma and gamma != 1.0:
-        # vips doesn't have power for arbitrary gamma on integer; cast to float first
-        num = num.cast("float") ** gamma
+        num = (num.cast("float") ** gamma)
 
-    out_min, out_max = fmt_range("ushort" if (force_ushort or mode == "absolute16") else fmt)
-    mapped = (num * (out_max - out_min) + out_min)
+    # map back to output integer format
+    out_fmt = "ushort" if (force_ushort or mode == "absolute16") else fmt
+    out_min, out_max = fmt_range(out_fmt)
+    mapped = (num * (out_max - out_min) + out_min).cast(out_fmt)
 
-    mapped = mapped.cast("ushort" if (force_ushort or mode == "absolute16") else fmt)
     return mapped, lo_used, hi_used
+
 
 def preview_u8(img: pyvips.Image, lo: float|None, hi: float|None) -> pyvips.Image:
     if lo is None or hi is None or not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:

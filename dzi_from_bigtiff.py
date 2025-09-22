@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 
-# one-time: pip install "pyvips[binary]" tqdm
+# one-time: pip install "pyvips[binary]" tqdm matplotlib
 # example call:
 #   python make_dzi.py "C:/path/to/folder" --tile 512 --overlap 1 --jpeg-q 90 \
-#       --split-channels false --workers 2
+#       --split-channels false --workers 2 --show-hist
 
 import os, re, time, argparse
 from pathlib import Path
@@ -15,6 +15,8 @@ os.environ.setdefault("VIPS_PROGRESS",   "1")   # print low-level progress, too
 from tqdm.auto import tqdm as _tqdm   # noqa: E402
 import pyvips                         # noqa: E402
 
+# Optional plotting (import lazily later if not requested)
+plt = None
 
 # ---------- progress-enabled dzsave ----------
 def _safe_disconnect(img, handle):
@@ -87,6 +89,55 @@ def open_as_u8(tif_path: Path) -> pyvips.Image:
     return img.copy_memory()  # detach from on-disk file
 
 
+# ---------- histogram helpers ----------
+_VIPS2NP = {
+    "uchar":  "uint8",
+    "char":   "int8",
+    "ushort": "uint16",
+    "short":  "int16",
+    "uint":   "uint32",
+    "int":    "int32",
+    "float":  "float32",
+    "double": "float64",
+}
+
+def _to_numpy(img: pyvips.Image):
+    """Copy a small pyvips image into a numpy array."""
+    fmt = img.format
+    if fmt not in _VIPS2NP:
+        # fallback: cast to float
+        img = img.cast("float")
+        fmt = "float"
+    buf = img.write_to_memory()
+    np_dtype = __import__("numpy").dtype(_VIPS2NP.get(fmt, "float32"))
+    import numpy as np
+    arr = np.ndarray(buffer=buf, dtype=np_dtype, shape=(img.height, img.width, img.bands))
+    return arr
+
+def plot_u8_hist(img_u8: pyvips.Image, title: str, logy: bool = True):
+    """
+    Plot histogram for an 8-bit image (single band: take band 0).
+    Uses vips.hist_find() for speed and very low memory.
+    """
+    global plt
+    if plt is None:
+        import matplotlib.pyplot as plt  # lazy import
+    # pick one band (treat as brightness)
+    band0 = img_u8.extract_band(0) if img_u8.bands > 1 else img_u8
+    h = band0.hist_find()  # 256-bin histogram
+    counts = _to_numpy(h).reshape(-1)
+    xs = list(range(counts.size))
+    plt.figure(figsize=(8, 3.5))
+    plt.bar(xs, counts, width=1.0)
+    if logy:
+        plt.yscale("log")
+    plt.title(title)
+    plt.xlabel("Value (0..255)")
+    plt.ylabel("Count" + (" (log)" if logy else ""))
+    plt.tight_layout()
+    plt.show()
+
+
 # ---------- CLI ----------
 def parse_args():
     p = argparse.ArgumentParser(
@@ -112,6 +163,10 @@ def parse_args():
     p.add_argument("--skip-if-exists", action=argparse.BooleanOptionalAction, default=True,
                    help="Skip if .dzi already exists (default true)")
     p.add_argument("--workers", type=int, default=2, help="libvips concurrency (best-effort)")
+    p.add_argument("--show-hist", action=argparse.BooleanOptionalAction, default=False,
+                   help="Show histograms (input u8 view, output u8 to dzsave)")
+    p.add_argument("--hist-logy", action=argparse.BooleanOptionalAction, default=True,
+                   help="Use log scale on histogram Y axis (default true)")
     return p.parse_args()
 
 
@@ -149,6 +204,10 @@ def main():
         except Exception:
             pass
 
+        # --- optional histogram at input stage (as seen by pipeline) ---
+        if args.show_hist:
+            plot_u8_hist(img8, title=f"[INPUT] {tif.name} (u8 view)", logy=bool(args.hist_logy))
+
         wrote_any = False
 
         # --- full-color DZI (only when RGB-ish) ---
@@ -157,6 +216,11 @@ def main():
             if args.skip_if_exists and Path(outbase_rgb + ".dzi").exists():
                 print(f"[skip] {outbase_rgb}.dzi exists")
             else:
+                # histogram of what we actually send out (srgb)
+                if args.show_hist:
+                    plot_u8_hist(img8.copy(interpretation="srgb"),
+                                 title=f"[OUTPUT] {tif.name} → RGB DZI (pre-write u8)", logy=bool(args.hist_logy))
+
                 dzsave_with_progress(
                     img8.copy(interpretation="srgb"),
                     outbase_rgb,
@@ -183,6 +247,10 @@ def main():
                         print(f"[skip] {outbase_ch}.dzi exists")
                         continue
                     ch = img8.extract_band(b if bands >= 3 else 0).copy(interpretation="b-w")
+
+                    if args.show_hist:
+                        plot_u8_hist(ch, title=f"[OUTPUT] {tif.name} → {name} DZI (pre-write u8)", logy=bool(args.hist_logy))
+
                     dzsave_with_progress(
                         ch,
                         outbase_ch,
@@ -203,6 +271,10 @@ def main():
                 print(f"[skip] {outbase_gray}.dzi exists")
             else:
                 gray = img8.extract_band(0).copy(interpretation="b-w") if img8.bands > 1 else img8
+
+                if args.show_hist:
+                    plot_u8_hist(gray, title=f"[OUTPUT] {tif.name} → Gray DZI (pre-write u8)", logy=bool(args.hist_logy))
+
                 dzsave_with_progress(
                     gray,
                     outbase_gray,

@@ -1,45 +1,44 @@
 #!/usr/bin/env python3
 # one-time: pip install "pyvips[binary]" tqdm matplotlib
-# example call:
-#   python dzi_from_bigtiff.py "C:/path/to/folder" --tile 512 --overlap 1 --jpeg-q 90 \
-#       --split-channels false --workers 2 --show-hist
 
 import os, re, time, argparse
 from pathlib import Path
 
 # --- set libvips env BEFORE importing pyvips ---
-os.environ.setdefault("VIPS_CONCURRENCY", "2")  # worker threads (best-effort on Windows)
-os.environ.setdefault("VIPS_PROGRESS",   "1")   # print low-level progress, too
-
-# Matplotlib: pick a headless backend automatically if there's no display
-import matplotlib
-if not os.environ.get("DISPLAY"):
-    matplotlib.use("Agg")  # safe for servers / terminals
-import matplotlib.pyplot as plt
+os.environ.setdefault("VIPS_CONCURRENCY", "2")  # worker threads (best-effort)
+os.environ.setdefault("VIPS_PROGRESS",   "1")   # print low-level progress
 
 from tqdm.auto import tqdm as _tqdm   # noqa: E402
 import pyvips                         # noqa: E402
 
+# We lazily import matplotlib only when plotting is requested
+_MPL_AVAILABLE = True
+try:
+    import matplotlib
+    # Use a non-interactive backend if none is set (works on servers)
+    if not matplotlib.get_backend().lower().startswith(("qt", "tk", "macosx")):
+        matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+except Exception:
+    _MPL_AVAILABLE = False
+    plt = None
 
-# ---------- low-level helpers ----------
+
+# ---------- helpers: open images ----------
 def open_native(tif_path: Path) -> pyvips.Image:
     """Open BigTIFF with random access, no type/colour changes."""
     return pyvips.Image.new_from_file(str(tif_path), access="random", page=0)
 
-def open_as_u8(tif_path: Path) -> pyvips.Image:
+def open_as_u8_legacy(tif_path: Path) -> pyvips.Image:
     """
-    Open BigTIFF and coerce to 8-bit for DZI.
-    Leaves band count intact; sets sensible interpretation:
-      - 1 band  -> b-w
-      - 3+ bands -> srgb (if not already)
+    Open BigTIFF and coerce to 8-bit like before (legacy).
     """
     img = pyvips.Image.new_from_file(str(tif_path), access="random", page=0)
-    # convert to 8-bit
     if img.format == "ushort":
         img = (img >> 8).cast("uchar")
     elif img.format != "uchar":
         img = img.cast("uchar")
-    # normalize interpretation
+
     if img.bands == 1:
         img = img.copy(interpretation="b-w")
     elif img.bands >= 3 and img.interpretation != "srgb":
@@ -47,9 +46,114 @@ def open_as_u8(tif_path: Path) -> pyvips.Image:
             img = img.colourspace("srgb")
         except Exception:
             img = img.copy(interpretation="srgb")
-    return img.copy_memory()  # detach from on-disk file
+    return img.copy_memory()
 
-# progress-enabled dzsave
+
+# ---------- numpy bridge ----------
+_VIPS2NP = {
+    "uchar":  "uint8",   "char":   "int8",
+    "ushort": "uint16",  "short":  "int16",
+    "uint":   "uint32",  "int":    "int32",
+    "float":  "float32", "double": "float64",
+}
+
+def vips_to_numpy(img: pyvips.Image):
+    import numpy as np
+    fmt = img.format
+    if fmt not in _VIPS2NP:
+        img = img.cast("float")
+        fmt = "float"
+    buf = img.write_to_memory()
+    return np.ndarray(buffer=buf,
+                      dtype=np.dtype(_VIPS2NP[fmt]),
+                      shape=(img.height, img.width, img.bands))
+
+
+# ---------- stats / mapping ----------
+def native_min_max(img: pyvips.Image) -> tuple[int, int]:
+    band0 = img.extract_band(0) if img.bands > 1 else img
+    return int(band0.min()), int(band0.max())
+
+def native_percentile_lo_hi_ushort(img: pyvips.Image, clip_percent: float) -> tuple[int, int]:
+    """
+    Compute lo/hi from a ushort (16-bit) image by percentiles using vips.hist_find().
+    clip_percent is per tail, e.g. 1.0 -> p1 / p99.
+    """
+    import numpy as np
+    band0 = img.extract_band(0) if img.bands > 1 else img
+    h = band0.hist_find()  # for ushort: 65536-bin histogram
+    counts = vips_to_numpy(h).reshape(-1)
+    cdf = counts.cumsum()
+    tot = int(cdf[-1]) if cdf.size else 0
+    if tot <= 0:
+        return native_min_max(img)
+    lo_idx = int((cdf >= tot * (clip_percent / 100.0)).argmax())
+    hi_idx = int((cdf >= tot * (1.0 - clip_percent / 100.0)).argmax())
+    return lo_idx, hi_idx
+
+def to_u8_linear(img: pyvips.Image, lo: float, hi: float) -> pyvips.Image:
+    """Map [lo,hi] -> [0,255] on all bands, clamp outside."""
+    if hi <= lo:
+        hi = lo + 1.0
+    scale  = 255.0 / (hi - lo)
+    offset = -lo * scale
+    out = img.linear(scale, offset).cast("uchar")
+    return out.copy(interpretation=("b-w" if out.bands == 1 else "srgb"))
+
+
+# ---------- histograms ----------
+def plot_native_hist(img_native: pyvips.Image, title: str, logy: bool, out_png: Path | None):
+    if not _MPL_AVAILABLE:
+        return
+    band0 = img_native.extract_band(0) if img_native.bands > 1 else img_native
+    if band0.format not in ("uchar","char","ushort","short","uint","int"):
+        # For floats we’d need binning; skip to avoid misleading plots
+        return
+    h = band0.hist_find()
+    counts = vips_to_numpy(h).reshape(-1)
+    xs = list(range(counts.size))
+    plt.figure(figsize=(9, 3.6))
+    plt.bar(xs, counts, width=1.0)
+    if logy: plt.yscale("log")
+    if band0.format == "ushort":
+        xlabel = "Value (0..65535)"
+    elif band0.format == "uchar":
+        xlabel = "Value (0..255)"
+    else:
+        vmin, vmax = native_min_max(band0)
+        xlabel = f"Value index (~{vmin}..{vmax})"
+    plt.title(title)
+    plt.xlabel(xlabel)
+    plt.ylabel("Count" + (" (log)" if logy else ""))
+    plt.tight_layout()
+    if out_png:
+        plt.savefig(out_png, dpi=120)
+        plt.close()
+    else:
+        plt.show()
+
+def plot_u8_hist(img_u8: pyvips.Image, title: str, logy: bool, out_png: Path | None):
+    if not _MPL_AVAILABLE:
+        return
+    band0 = img_u8.extract_band(0) if img_u8.bands > 1 else img_u8
+    h = band0.hist_find()  # 256 bins
+    counts = vips_to_numpy(h).reshape(-1)
+    xs = list(range(counts.size))
+    plt.figure(figsize=(9, 3.6))
+    plt.bar(xs, counts, width=1.0)
+    if logy: plt.yscale("log")
+    plt.title(title)
+    plt.xlabel("Value (0..255)")
+    plt.ylabel("Count" + (" (log)" if logy else ""))
+    plt.tight_layout()
+    if out_png:
+        plt.savefig(out_png, dpi=120)
+        plt.close()
+    else:
+        plt.show()
+
+
+# ---------- progress-enabled dzsave ----------
 def _safe_disconnect(img, handle):
     for name in ("signal_disconnect", "disconnect"):
         try:
@@ -92,88 +196,6 @@ def dzsave_with_progress(img: pyvips.Image, outbase: str, desc: str, **opts):
     print(f"✅ {desc} -> {outbase}.dzi  ({time.time()-t0:.1f}s)")
 
 
-# ---------- histogram helpers ----------
-_VIPS2NP = {
-    "uchar":  "uint8",  "char":   "int8",
-    "ushort": "uint16", "short":  "int16",
-    "uint":   "uint32", "int":    "int32",
-    "float":  "float32","double": "float64",
-}
-
-def _vips_to_numpy(img: pyvips.Image):
-    """Copy a small pyvips image into a numpy array (used for hist images)."""
-    import numpy as np
-    fmt = img.format
-    if fmt not in _VIPS2NP:
-        img = img.cast("float")
-        dt = np.float32
-    else:
-        dt = np.dtype(_VIPS2NP[fmt])
-    buf = img.write_to_memory()
-    return np.ndarray(buffer=buf, dtype=dt, shape=(img.height, img.width, img.bands))
-
-def _show_or_save(fig, outpath: Path, show: bool, save: bool):
-    wrote = None
-    if save:
-        outpath.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(outpath, dpi=110)
-        wrote = outpath
-    if show:
-        try:
-            plt.show()
-        except Exception:
-            pass
-    plt.close(fig)
-    return wrote
-
-def plot_native_hist(img_native: pyvips.Image, title: str, logy: bool = True):
-    """
-    Plot histogram in the image's *native* domain (integers only).
-    Returns a matplotlib Figure (caller decides show/save).
-    """
-    band0 = img_native.extract_band(0) if img_native.bands > 1 else img_native
-    if band0.format not in ("uchar","char","ushort","short","uint","int"):
-        return None  # float types: caller should fall back to u8
-
-    h = band0.hist_find()                       # integer-domain histogram
-    counts = _vips_to_numpy(h).reshape(-1)
-
-    xs = range(counts.size)
-    if band0.format == "ushort":
-        xlabel = "Value (0..65535)"
-    elif band0.format == "uchar":
-        xlabel = "Value (0..255)"
-    else:
-        # For other integer formats, label generically; counts.size is full integer domain
-        xlabel = f"Value index (bins={len(counts)})"
-
-    fig, ax = plt.subplots(figsize=(8.0, 3.2))
-    ax.bar(xs, counts, width=1.0)
-    if logy:
-        ax.set_yscale("log")
-    ax.set_title(title + f"  ({band0.format})")
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel("Count" + (" (log)" if logy else ""))
-    fig.tight_layout()
-    return fig
-
-def plot_u8_hist(img_u8: pyvips.Image, title: str, logy: bool = True):
-    """Histogram for an 8-bit image (band 0 if multi-band)."""
-    band0 = img_u8.extract_band(0) if img_u8.bands > 1 else img_u8
-    h = band0.hist_find()  # 256 bins
-    counts = _vips_to_numpy(h).reshape(-1)
-    xs = range(counts.size)
-    fig, ax = plt.subplots(figsize=(8.0, 3.2))
-    ax.bar(xs, counts, width=1.0)
-    if logy:
-        ax.set_yscale("log")
-    ax.set_title(title)
-    ax.set_xlabel("Value (0..255)")
-    ax.set_ylabel("Count" + (" (log)" if logy else ""))
-    fig.tight_layout()
-    return fig
-
-
 # ---------- CLI ----------
 def parse_args():
     p = argparse.ArgumentParser(
@@ -199,13 +221,23 @@ def parse_args():
     p.add_argument("--skip-if-exists", action=argparse.BooleanOptionalAction, default=True,
                    help="Skip if .dzi already exists (default true)")
     p.add_argument("--workers", type=int, default=2, help="libvips concurrency (best-effort)")
-    # Histogram controls
+
+    # Histogram display
     p.add_argument("--show-hist", action=argparse.BooleanOptionalAction, default=False,
-                   help="Show input/output histograms (interactive sessions only)")
-    p.add_argument("--save-hist", action=argparse.BooleanOptionalAction, default=True,
-                   help="Also save histogram PNGs next to outputs (default true)")
+                   help="Show/save histograms (input native + output u8)")
     p.add_argument("--hist-logy", action=argparse.BooleanOptionalAction, default=True,
-                   help="Log-scale Y axis for histograms (default true)")
+                   help="Log scale on histogram Y axis (default true)")
+    p.add_argument("--hist-out", default=None,
+                   help="If set, save histogram PNGs into this folder instead of showing")
+
+    # 16-bit -> 8-bit mapping
+    p.add_argument("--norm", choices=["none","range","percentile","absolute"], default="percentile",
+                   help="u8 mapping: none (>>8), range (min..max), percentile (clip), absolute (lo/hi)")
+    p.add_argument("--clip-percent", type=float, default=1.0,
+                   help="for --norm percentile: clip this percent on each tail (default 1.0)")
+    p.add_argument("--lo", type=float, default=None, help="for --norm absolute: lower bound")
+    p.add_argument("--hi", type=float, default=None, help="for --norm absolute: upper bound")
+
     return p.parse_args()
 
 
@@ -216,6 +248,10 @@ def main():
     in_dir  = Path(args.folder)
     out_dir = Path(args.out_dir) if args.out_dir else in_dir
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    hist_dir = Path(args.hist_out) if args.hist_out else None
+    if hist_dir:
+        hist_dir.mkdir(parents=True, exist_ok=True)
 
     # choose suffix string for dzsave
     if args.suffix == "jpg":
@@ -233,27 +269,52 @@ def main():
         m = re.search(r"_Z(\d+)\.tif$", tif.name, flags=re.I)
         zlabel = m.group(1) if m else tif.stem
 
-        # Open both native (for stats/hist) and 8-bit view (for DZI)
         img_native = open_native(tif)
-        img8       = open_as_u8(tif)
 
-        # quick min/max on native
+        # quick min/max (native)
         try:
-            nmin, nmax = int(img_native.min()), int(img_native.max())
+            nmin, nmax = native_min_max(img_native)
             print(f"{tif.name}: native range {nmin}..{nmax} ({img_native.format}), "
                   f"bands={img_native.bands}, {img_native.width}×{img_native.height}")
         except Exception:
-            pass
+            nmin, nmax = 0, 0
 
-        # INPUT histogram (prefer native integer; else fall back to u8)
-        if args.show_hist or args.save_hist:
-            fig_in = plot_native_hist(img_native, f"[INPUT native] {tif.name}", logy=args.hist_logy)
-            if fig_in is None:
-                fig_in = plot_u8_hist(img8, f"[INPUT u8 view] {tif.name}", logy=args.hist_logy)
-            out_png_in = out_dir / f"{tif.stem}_hist_input.png"
-            wrote = _show_or_save(fig_in, out_png_in, show=args.show_hist, save=args.save_hist)
-            if wrote:
-                print(f"Histogram (input) saved -> {wrote}")
+        # Input histogram (native)
+        if args.show_hist:
+            out_png = (hist_dir / f"{tif.stem}_input_native.png") if hist_dir else None
+            plot_native_hist(img_native, title=f"[INPUT native] {tif.name}  ({img_native.format})",
+                             logy=bool(args.hist_logy), out_png=out_png)
+
+        # Decide 16-bit -> 8-bit mapping
+        norm = args.norm.lower()
+        if norm == "none":
+            img8 = open_as_u8_legacy(tif)
+            lo_used, hi_used = None, None
+        elif norm == "range":
+            lo_used, hi_used = nmin, nmax
+            img8 = to_u8_linear(img_native, lo_used, hi_used)
+        elif norm == "absolute":
+            lo_used = nmin if args.lo is None else float(args.lo)
+            hi_used = nmax if args.hi is None else float(args.hi)
+            if hi_used < lo_used: lo_used, hi_used = hi_used, lo_used
+            img8 = to_u8_linear(img_native, lo_used, hi_used)
+        else:  # percentile
+            if img_native.format == "ushort":
+                lo_used, hi_used = native_percentile_lo_hi_ushort(img_native, float(args.clip_percent))
+            else:
+                lo_used, hi_used = nmin, nmax
+            img8 = to_u8_linear(img_native, lo_used, hi_used)
+
+        if lo_used is None:
+            print(f"  → u8 mapping: legacy cast (norm=none)")
+        else:
+            print(f"  → u8 mapping: lo={int(round(lo_used))}, hi={int(round(hi_used))} "
+                  f"(norm={norm}{', clip%='+str(args.clip_percent) if norm=='percentile' else ''})")
+
+        # Output histogram (u8 we actually write)
+        if args.show_hist:
+            out_png = (hist_dir / f"{tif.stem}_output_u8.png") if hist_dir else None
+            plot_u8_hist(img8, title=f"[OUTPUT u8] {tif.stem}", logy=bool(args.hist_logy), out_png=out_png)
 
         wrote_any = False
 
@@ -263,15 +324,6 @@ def main():
             if args.skip_if_exists and Path(outbase_rgb + ".dzi").exists():
                 print(f"[skip] {outbase_rgb}.dzi exists")
             else:
-                # OUTPUT histogram for exactly what we're writing
-                if args.show_hist or args.save_hist:
-                    fig_out = plot_u8_hist(img8.copy(interpretation="srgb"),
-                                           f"[OUTPUT u8] {tif.stem}_rgb", logy=args.hist_logy)
-                    out_png_out = out_dir / f"{tif.stem}_hist_output_rgb.png"
-                    wrote = _show_or_save(fig_out, out_png_out, show=args.show_hist, save=args.save_hist)
-                    if wrote:
-                        print(f"Histogram (output RGB) saved -> {wrote}")
-
                 dzsave_with_progress(
                     img8.copy(interpretation="srgb"),
                     outbase_rgb,
@@ -298,14 +350,6 @@ def main():
                         print(f"[skip] {outbase_ch}.dzi exists")
                         continue
                     ch = img8.extract_band(b if bands >= 3 else 0).copy(interpretation="b-w")
-
-                    if args.show_hist or args.save_hist:
-                        fig_out = plot_u8_hist(ch, f"[OUTPUT u8] {tif.stem}_{name}", logy=args.hist_logy)
-                        out_png_out = out_dir / f"{tif.stem}_hist_output_{name}.png"
-                        wrote = _show_or_save(fig_out, out_png_out, show=args.show_hist, save=args.save_hist)
-                        if wrote:
-                            print(f"Histogram (output {name}) saved -> {wrote}")
-
                     dzsave_with_progress(
                         ch,
                         outbase_ch,
@@ -319,21 +363,13 @@ def main():
                     )
                     wrote_any = True
 
-        # --- guaranteed grayscale fallback (bands==1, or nothing else wrote) ---
+        # --- guaranteed grayscale fallback ---
         if not wrote_any:
             outbase_gray = str(out_dir / f"{tif.stem}_gray")
             if args.skip_if_exists and Path(outbase_gray + ".dzi").exists():
                 print(f"[skip] {outbase_gray}.dzi exists")
             else:
                 gray = img8.extract_band(0).copy(interpretation="b-w") if img8.bands > 1 else img8
-
-                if args.show_hist or args.save_hist:
-                    fig_out = plot_u8_hist(gray, f"[OUTPUT u8] {tif.stem}_gray", logy=args.hist_logy)
-                    out_png_out = out_dir / f"{tif.stem}_hist_output_gray.png"
-                    wrote = _show_or_save(fig_out, out_png_out, show=args.show_hist, save=args.save_hist)
-                    if wrote:
-                        print(f"Histogram (output gray) saved -> {wrote}")
-
                 dzsave_with_progress(
                     gray,
                     outbase_gray,

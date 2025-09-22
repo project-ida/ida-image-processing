@@ -1,35 +1,35 @@
 #!/usr/bin/env python3
 """
-Stitch NPZ-backed SEM tiles (from H5 pipeline) to pyramidal BigTIFF per Z layer.
+Stitch NPZ-backed SEM tiles (from H5 pipeline) into pyramidal BigTIFF(s).
 
-Expected inputs in <h5data_folder>:
-  - summary_table.csv   (must include X_rel_um, Y_rel_um, and either TileWidth_um/TileHeight_um
-                         or width_px/height_px + px_x_um/px_y_um, plus npz_path; Z_layer optional)
-  - *_sem.npz           (key 'sem_data', raw 2D array per tile)
+Inputs in <h5data_folder>:
+  - summary_table.csv (must include: X_rel_um, Y_rel_um, npz_path; Z_layer optional)
+  - *_sem.npz (key 'sem_data' -> 2D raw array; dtype often int16/uint16/uint8)
 
-Example:
-  python stitch_h5data.py /path/to/h5data --scale 0.5 --feather-px 30 --background white
+Examples:
+  python stitch_h5data.py ./h5data --scale 0.5 --norm auto --clip-percent 1.0
+  python stitch_h5data.py ./h5data --norm fixed --lo 4000 --hi 18000
+  python stitch_h5data.py ./h5data --px_x_um 0.632324 --px_y_um 0.632324
 """
 
 import os, math, argparse, shutil
 from pathlib import Path
-
-# configure libvips before importing pyvips
-os.environ.setdefault("VIPS_CONCURRENCY", "2")
-os.environ.setdefault("VIPS_PROGRESS",   "1")
-
 import numpy as np
 import pandas as pd
 import pyvips
 from tqdm import tqdm
 
-# ---------------- helpers (ported/adapted from stitch_ndtiff.py) ----------------
+# --- libvips runtime config (env var can be overridden by CLI) ---------------
+os.environ.setdefault("VIPS_CONCURRENCY", "2")
+os.environ.setdefault("VIPS_PROGRESS", "1")
+
+# ----------------------------- CSV helpers -----------------------------------
 
 def must_have_columns(df: pd.DataFrame) -> pd.DataFrame:
     need = ["X_rel_um", "Y_rel_um", "npz_path"]
     miss = [c for c in need if c not in df.columns]
     if miss:
-        raise ValueError(f"summary_table.csv missing required columns: {miss}")
+        raise ValueError(f"summary_table.csv missing required column(s): {miss}")
     if "Z_layer" not in df.columns:
         df = df.copy()
         df["Z_layer"] = 0
@@ -38,9 +38,9 @@ def must_have_columns(df: pd.DataFrame) -> pd.DataFrame:
 def infer_px_um_from_df(df: pd.DataFrame, arg_px_x_um, arg_px_y_um) -> tuple[float, float]:
     """
     Resolve µm/px. Priority:
-      1) --px_x_um/--px_y_um if both provided,
-      2) df columns px_x_um / px_y_um (robust median over non-null),
-      3) error with the same helpful message as ndtiff stitcher.
+      1) --px_x_um/--px_y_um (if both provided),
+      2) median of df['px_x_um'] and df['px_y_um'] if present/non-null,
+      3) exit with a helpful message.
     """
     if arg_px_x_um is not None and arg_px_y_um is not None:
         return float(arg_px_x_um), float(arg_px_y_um)
@@ -51,10 +51,13 @@ def infer_px_um_from_df(df: pd.DataFrame, arg_px_x_um, arg_px_y_um) -> tuple[flo
         if not px_x.empty and not px_y.empty:
             return float(px_x.median()), float(px_y.median())
 
-    print("px_x_um and/or px_y_um information not found in the metadata. "
-          "If you know this information, we can proceed by you entering it as parameters "
-          "--px_x_um and --px_y_um")
+    print(
+        "px_x_um and/or px_y_um information not found in the metadata. "
+        "If you know this information, please pass --px_x_um and --px_y_um."
+    )
     raise SystemExit(1)
+
+# ----------------------------- image helpers ---------------------------------
 
 _mask_cache: dict[tuple[int,int,int], pyvips.Image] = {}
 
@@ -77,33 +80,6 @@ def feather_mask_vips(w: int, h: int, fpx: int) -> pyvips.Image:
     _mask_cache[key] = wm
     return wm
 
-def expected_tile_px_from_row(r, um_per_px_x, um_per_px_y):
-    """
-    Return (w,h) in px using TileWidth_um/TileHeight_um if present,
-    else use width_px/height_px. None if insufficient info.
-    """
-    # Preferred path: um sizes + µm/px
-    tw = getattr(r, "TileWidth_um", None)
-    th = getattr(r, "TileHeight_um", None)
-    if tw is not None and not pd.isna(tw) and th is not None and not pd.isna(th):
-        try:
-            w = int(round(float(tw) / um_per_px_x))
-            h = int(round(float(th) / um_per_px_y))
-            return (max(1, w), max(1, h))
-        except Exception:
-            pass
-
-    # Fallback: explicit pixel sizes
-    if hasattr(r, "width_px") and hasattr(r, "height_px"):
-        try:
-            w = int(r.width_px)
-            h = int(r.height_px)
-            if w > 0 and h > 0:
-                return (w, h)
-        except Exception:
-            pass
-    return None
-
 def load_npz_sem(path: Path) -> np.ndarray | None:
     """Load raw 2D sem_data from *_sem.npz; return None on any failure."""
     try:
@@ -118,14 +94,23 @@ def load_npz_sem(path: Path) -> np.ndarray | None:
 def numpy_to_vips_gray(a: np.ndarray) -> tuple[pyvips.Image, str]:
     """
     Convert 2D numpy -> vips single-band image; return (image, fmt_str).
-    Keeps uint16 when present, else uint8.
+    Keeps 16-bit signed/unsigned when present; else 8-bit.
     """
     if a.dtype == np.uint16:
         fmt = "ushort"
-    else:
-        if a.dtype != np.uint8:
-            a = a.astype(np.uint8, copy=False)
+    elif a.dtype == np.int16:
+        fmt = "short"
+    elif a.dtype == np.uint8:
         fmt = "uchar"
+    else:
+        # sensible fallback: prefer 16-bit signed for other integer types, else 8-bit
+        if np.issubdtype(a.dtype, np.integer):
+            a = a.astype(np.int16, copy=False)
+            fmt = "short"
+        else:
+            a = a.astype(np.uint8, copy=False)
+            fmt = "uchar"
+
     h, w = a.shape
     im = pyvips.Image.new_from_memory(np.ascontiguousarray(a).data, w, h, 1, fmt)
     return im.copy(interpretation="b-w"), fmt
@@ -133,10 +118,21 @@ def numpy_to_vips_gray(a: np.ndarray) -> tuple[pyvips.Image, str]:
 def replicate(img: pyvips.Image, n: int) -> pyvips.Image:
     return pyvips.Image.bandjoin([img] * n)
 
-# ---------------- main ----------------
+def fmt_output_range(fmt: str) -> tuple[float, float]:
+    """Return (min,max) representable values for a vips format."""
+    if fmt == "uchar":
+        return 0.0, 255.0
+    if fmt == "ushort":
+        return 0.0, 65535.0
+    if fmt == "short":
+        return -32768.0, 32767.0
+    # fallback
+    return 0.0, 255.0
+
+# ----------------------------- main ------------------------------------------
 
 def main():
-    ap = argparse.ArgumentParser(description="Stitch H5/NPZ SEM tiles to pyramidal BigTIFF per Z layer (optional feather).")
+    ap = argparse.ArgumentParser(description="Stitch H5/NPZ SEM tiles to pyramidal BigTIFF per Z layer.")
     ap.add_argument("h5data_folder", help="Folder containing summary_table.csv and *_sem.npz files")
     ap.add_argument("--out-dir", default=None, help="Output directory (default: <h5data_folder>/stitched)")
     ap.add_argument("--scale", type=float, default=0.5, help="Master scale factor (1.0 = full-res)")
@@ -146,12 +142,18 @@ def main():
     ap.add_argument("--preview-max", type=int, default=1600)
     ap.add_argument("--overwrite", action=argparse.BooleanOptionalAction, default=False)
     ap.add_argument("--vips-workers", type=int, default=2)
-    # channel option for parity with ndtiff stitcher; SEM is 1-band, but allow 3-band export
     ap.add_argument("--channel", choices=["gray", "rgb"], default="gray",
                     help="Export single-band grayscale (default) or replicate to RGB")
-    # optional pixel-size overrides (µm/px)
+    # pixel-size overrides (µm/px)
     ap.add_argument("--px_x_um", type=float, default=None, help="Override pixel size along X in µm/px")
     ap.add_argument("--px_y_um", type=float, default=None, help="Override pixel size along Y in µm/px")
+    # normalization options (like ndtiff)
+    ap.add_argument("--norm", choices=["none","auto","fixed"], default="none",
+                    help="Intensity normalization: none (raw), auto (percentiles), fixed (lo/hi)")
+    ap.add_argument("--clip-percent", type=float, default=1.0,
+                    help="For --norm auto: clip percent at both ends (e.g., 1.0 → p1/p99)")
+    ap.add_argument("--lo", type=float, default=None, help="For --norm fixed: low clip (raw units)")
+    ap.add_argument("--hi", type=float, default=None, help="For --norm fixed: high clip (raw units)")
 
     args = ap.parse_args()
     os.environ["VIPS_CONCURRENCY"] = str(args.vips_workers)
@@ -169,19 +171,18 @@ def main():
     base_name = in_dir.name
 
     df = must_have_columns(pd.read_csv(csv_path))
-
     # resolve px sizes (µm/px)
     px_x_um, px_y_um = infer_px_um_from_df(df, args.px_x_um, args.px_y_um)
     um_to_px_x = lambda um: um / px_x_um
     um_to_px_y = lambda um: um / px_y_um
 
-    # determine number of Z layers
+    # determine Z layers
     try:
         S = int(df["Z_layer"].max()) + 1
     except Exception:
         S = 1
 
-    # compute canvas (native), then scale
+    # canvas in native px, then apply scale
     x_max_um = float((df["X_rel_um"] + df.get("TileWidth_um", 0)).max())
     y_max_um = float((df["Y_rel_um"] + df.get("TileHeight_um", 0)).max())
     Wn = int(math.ceil(um_to_px_x(x_max_um)))
@@ -191,11 +192,7 @@ def main():
     H = max(1, int(round(Hn * SCALE)))
     print(f"Canvas (native): {Wn}×{Hn}  -> scale={SCALE}  =>  {W}×{H}")
 
-    bgval = 255 if args.background.lower() == "white" else 0
-    if args.channel == "rgb":
-        bg_rgb = [bgval, bgval, bgval]
-
-    # Try to print disk space info
+    # space info
     try:
         tmp_dir = Path(os.environ.get("VIPS_TMPDIR") or os.environ.get("TMP") or os.environ.get("TEMP") or ".")
         _, _, out_free = shutil.disk_usage(out_dir)
@@ -210,43 +207,60 @@ def main():
             print(f"[warn] no rows for Z={z}; skipping.")
             continue
 
+        # probe dtype + global min/max from NPZ tiles (for this Z)
+        probed_fmt = None
+        global_min = np.inf
+        global_max = -np.inf
+        for pth in dfz["npz_path"]:
+            a = load_npz_sem(Path(pth))
+            if a is None or a.size == 0:
+                continue
+            # dtype
+            if probed_fmt is None:
+                _, probed_fmt = numpy_to_vips_gray(a)
+            # min/max
+            amin = float(np.nanmin(a))
+            amax = float(np.nanmax(a))
+            if amin < global_min: global_min = amin
+            if amax > global_max: global_max = amax
+
+        if not np.isfinite(global_min) or not np.isfinite(global_max):
+            print(f"[warn] Z{z}: could not read any NPZ tiles; skipping.")
+            continue
+
+        # bit-depth guess for display
+        bit_guess = "8-bit" if (global_min >= 0 and global_max <= 255) else "16-bit"
+        print(f"\nZ{z} NPZ stats -> min={global_min:.3g}, max={global_max:.3g}  |  dtype={probed_fmt}  (looks {bit_guess})")
+
+        # background in *image fmt* range
+        if probed_fmt == "ushort":
+            bgval_dtype = 65535 if args.background == "white" else 0
+        elif probed_fmt == "short":
+            bgval_dtype = 32767 if args.background == "white" else -32768
+        else:  # uchar
+            bgval_dtype = 255 if args.background == "white" else 0
+
         tiff_path = out_dir / f"{base_name}_Z{z}.tif"
         prev_path = out_dir / f"{base_name}_Z{z}_preview.png"
 
         if tiff_path.exists() and not args.overwrite:
             print(f"[skip] {tiff_path} exists.")
+            # still produce a preview if needed
             if not prev_path.exists():
                 try:
                     im = pyvips.Image.new_from_file(str(tiff_path), access="sequential")
                     s = min(1.0, args.preview_max / max(im.width, im.height))
                     prv = im.resize(s) if s < 1.0 else im
-                    prv.pngsave(str(prev_path), compression=6)
+                    # displayable 8-bit preview
+                    prv8 = _preview_from_vips(prv)
+                    prv8.pngsave(str(prev_path), compression=6)
                     print(f"✅ Preview (from existing): {prev_path}")
                 except Exception as e:
                     print(f"[warn] cannot create preview from existing TIFF: {e}")
             continue
 
-        # Probe bit depth on first valid NPZ of this Z
-        fmt = "uchar"  # default
-        probe_done = False
-        for r in dfz.itertuples(index=False):
-            a = load_npz_sem(Path(getattr(r, "npz_path")))
-            if a is None:
-                continue
-            fmt = "ushort" if a.dtype == np.uint16 else "uchar"
-            probe_done = True
-            break
-        if not probe_done:
-            print(f"[warn] Z{z}: no readable NPZ tiles found; skipping.")
-            continue
-
-        print(f"\n=== Z{z}: composing {len(dfz)} tiles on {W}×{H} "
-              f"(feather={args.feather_px}px, channel={args.channel}) ===")
-
-        bad_tiles = 0
-
+        # compose mosaic (weighted if feather > 0)
         if args.feather_px > 0:
-            # weighted accumulation
             if args.channel == "rgb":
                 acc  = pyvips.Image.black(W, H, bands=3).cast("float")
                 wacc = pyvips.Image.black(W, H).cast("float")
@@ -255,91 +269,97 @@ def main():
                 wacc = pyvips.Image.black(W, H).cast("float")
 
             for r in tqdm(dfz.itertuples(index=False), total=len(dfz), desc=f"Z{z} compose"):
-                x0 = int(round(um_to_px_x(float(r.X_rel_um)) * SCALE))
-                y0 = int(round(um_to_px_y(float(r.Y_rel_um)) * SCALE))
+                x0 = int(round((r.X_rel_um / px_x_um) * SCALE))
+                y0 = int(round((r.Y_rel_um / px_y_um) * SCALE))
 
-                a  = load_npz_sem(Path(getattr(r, "npz_path")))
+                a = load_npz_sem(Path(r.npz_path))
                 if a is None:
-                    bad_tiles += 1
                     continue
-
-                exp = expected_tile_px_from_row(r, px_x_um, px_y_um)
-                if exp is not None:
-                    aw, ah = exp
-                    # tolerate small diffs (scanner rounding)
-                    if not (abs(a.shape[1]-aw) <= 5 and abs(a.shape[0]-ah) <= 5):
-                        # skip size mismatches to avoid mosaic corruption
-                        bad_tiles += 1
-                        continue
-
-                t, tfmt = numpy_to_vips_gray(a)
+                tile_v, tfmt = numpy_to_vips_gray(a)
                 if SCALE != 1.0:
-                    t = t.resize(SCALE, kernel="linear")
+                    tile_v = tile_v.resize(SCALE, kernel="linear")
 
-                wm = feather_mask_vips(t.width, t.height, int(args.feather_px))
+                wm = feather_mask_vips(tile_v.width, tile_v.height, int(args.feather_px))
                 if args.channel == "rgb":
-                    t_rgb = replicate(t, 3)
-                    acc   = acc.insert(t_rgb * replicate(wm, 3), x0, y0)
+                    tile_v = replicate(tile_v, 3)
+                    acc    = acc.insert(tile_v * replicate(wm, 3), x0, y0)
                 else:
-                    acc   = acc.insert(t * wm, x0, y0)
+                    acc    = acc.insert(tile_v * wm, x0, y0)
                 wacc = wacc.insert(wm, x0, y0)
 
             eps = 1e-6
             if args.channel == "rgb":
                 w3   = replicate(wacc + eps, 3)
-                outf = (acc / w3).cast(fmt)
-                bgim = (pyvips.Image.black(W, H, bands=3) + [bgval]*3).cast(fmt)
-                mosaic = (wacc > 0).ifthenelse(outf, bgim).copy(interpretation="srgb")
+                mosaic = (acc / w3)
             else:
-                outf = (acc / (wacc + eps)).cast(fmt)
-                bgim = (pyvips.Image.black(W, H) + bgval).cast(fmt)
-                mosaic = (wacc > 0).ifthenelse(outf, bgim).copy(interpretation="b-w")
+                mosaic = (acc / (wacc + eps))
+
+            # holes to background
+            if args.channel == "rgb":
+                bg = (pyvips.Image.black(W, H, bands=3) + [bgval_dtype]*3).cast(probed_fmt)
+                mosaic = (wacc > 0).ifthenelse(mosaic.cast(probed_fmt), bg)
+            else:
+                bg = (pyvips.Image.black(W, H) + bgval_dtype).cast(probed_fmt)
+                mosaic = (wacc > 0).ifthenelse(mosaic.cast(probed_fmt), bg)
 
         else:
-            # fast insert
+            # fast insert path
             if args.channel == "rgb":
-                mosaic = (pyvips.Image.black(W, H, bands=3).cast(fmt)
-                          .copy(interpretation="srgb")) + [bgval]*3
+                mosaic = (pyvips.Image.black(W, H, bands=3).cast(probed_fmt)
+                          .copy(interpretation="srgb")) + [bgval_dtype]*3
             else:
-                mosaic = (pyvips.Image.black(W, H).cast(fmt)
-                          .copy(interpretation="b-w")) + bgval
+                mosaic = (pyvips.Image.black(W, H).cast(probed_fmt)
+                          .copy(interpretation="b-w")) + bgval_dtype
 
             for r in tqdm(dfz.itertuples(index=False), total=len(dfz), desc=f"Z{z} compose"):
-                x0 = int(round(um_to_px_x(float(r.X_rel_um)) * SCALE))
-                y0 = int(round(um_to_px_y(float(r.Y_rel_um)) * SCALE))
-
-                a  = load_npz_sem(Path(getattr(r, "npz_path")))
+                x0 = int(round((r.X_rel_um / px_x_um) * SCALE))
+                y0 = int(round((r.Y_rel_um / px_y_um) * SCALE))
+                a  = load_npz_sem(Path(r.npz_path))
                 if a is None:
-                    bad_tiles += 1
                     continue
-
-                exp = expected_tile_px_from_row(r, px_x_um, px_y_um)
-                if exp is not None:
-                    aw, ah = exp
-                    if not (abs(a.shape[1]-aw) <= 5 and abs(a.shape[0]-ah) <= 5):
-                        bad_tiles += 1
-                        continue
-
-                t, tfmt = numpy_to_vips_gray(a)
+                tile_v, tfmt = numpy_to_vips_gray(a)
                 if SCALE != 1.0:
-                    t = t.resize(SCALE, kernel="linear")
-
+                    tile_v = tile_v.resize(SCALE, kernel="linear")
                 if args.channel == "rgb":
-                    mosaic = mosaic.insert(replicate(t, 3), x0, y0)
+                    mosaic = mosaic.insert(replicate(tile_v, 3), x0, y0)
                 else:
-                    mosaic = mosaic.insert(t, x0, y0)
+                    mosaic = mosaic.insert(tile_v, x0, y0)
 
-        if bad_tiles:
-            print(f"[warn] Z{z}: skipped {bad_tiles} tile(s) due to size/header/read issues.")
+        # ---------------- Normalization (optional) ----------------
+        # Apply to the *mosaic* so the whole image uses a consistent mapping.
+        def apply_norm(vimg: pyvips.Image) -> pyvips.Image:
+            if args.norm == "none":
+                return vimg
+
+            out_min, out_max = fmt_output_range(probed_fmt)
+            if args.norm == "fixed":
+                if args.lo is None or args.hi is None or args.hi <= args.lo:
+                    raise SystemExit("--norm fixed requires valid --lo <v> and --hi <v> (hi>lo).")
+                lo, hi = float(args.lo), float(args.hi)
+            elif args.norm == "auto":
+                p = float(args.clip_percent)
+                # percentiles from the mosaic (libvips computes efficiently)
+                lo = float(vimg.percentiles(p))
+                hi = float(vimg.percentiles(100.0 - p))
+                if hi <= lo:
+                    lo, hi = global_min, global_max
+            else:
+                return vimg
+
+            # (img - lo) * (out_range/(hi-lo)) + out_min, then cast to fmt
+            scale  = (out_max - out_min) / max(hi - lo, 1e-6)
+            vimg_n = ((vimg - lo) * scale + out_min).cast(probed_fmt)
+            return vimg_n
+
+        mosaic = apply_norm(mosaic)
 
         # save pyramidal BigTIFF
-        save_im = mosaic
         try:
-            save_im = save_im.copy(interpretation="srgb" if args.channel == "rgb" else "b-w")
+            mosaic = mosaic.copy(interpretation="srgb" if args.channel == "rgb" else "b-w")
         except Exception:
             pass
 
-        save_im.tiffsave(
+        mosaic.tiffsave(
             str(tiff_path),
             tile=True,
             compression="lzw",
@@ -349,13 +369,39 @@ def main():
         )
         print(f"✅ BigTIFF written: {tiff_path}")
 
-        # preview
+        # --- Preview PNG (always 8-bit for display) ---
+        # derive from the *normalized* mosaic so it matches output look
         s = min(1.0, args.preview_max / max(W, H))
-        prv = save_im.resize(s) if s < 1.0 else save_im
-        prv.pngsave(str(prev_path), compression=6)
+        prv = mosaic.resize(s) if s < 1.0 else mosaic
+        prv8 = _preview_from_vips(prv)  # robust 8-bit mapping for viewing
+        prv8.pngsave(str(prev_path), compression=6)
         print(f"✅ Preview PNG:   {prev_path}")
 
     print("All done.")
+
+# ---------- preview helper (8-bit display mapping, robust) --------------------
+
+def _preview_from_vips(vimg: pyvips.Image, p_lo=1.0, p_hi=99.0) -> pyvips.Image:
+    """
+    Return an 8-bit display image using robust percentile clipping.
+    Works for uchar/ushort/short inputs; preserves bands.
+    """
+    # compute percentiles on a single band (monochrome mosaic)
+    try:
+        lo = float(vimg.percentiles(p_lo))
+        hi = float(vimg.percentiles(p_hi))
+    except Exception:
+        # fallback: min/max if percentiles unsupported
+        lo = float(vimg.min())
+        hi = float(vimg.max())
+    if hi <= lo:
+        hi = lo + 1.0
+    scaled = ((vimg - lo) * (255.0 / (hi - lo))).cast("uchar")
+    if scaled.bands == 1:
+        return scaled.copy(interpretation="b-w")
+    return scaled.copy(interpretation="srgb")
+
+# ------------------------------------------------------------------------------
 
 if __name__ == "__main__":
     main()

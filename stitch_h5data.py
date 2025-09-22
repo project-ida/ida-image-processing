@@ -25,6 +25,29 @@ from tqdm.auto import tqdm
 
 # ---------- helpers ----------
 
+# --- add near top (helpers) ---
+import numpy as np
+
+def sample_npz_percentiles(npz_paths, p, sample_per_tile=5000, seed=0):
+    """Return (lo, hi) percentiles across all NPZ tiles."""
+    rng = np.random.default_rng(seed)
+    samples = []
+    for pth in npz_paths:
+        try:
+            a = np.load(pth)["sem_data"]
+            a = a.astype(np.int32, copy=False).ravel()
+            if sample_per_tile and a.size > sample_per_tile:
+                idx = rng.choice(a.size, sample_per_tile, replace=False)
+                a = a[idx]
+            samples.append(a)
+        except Exception:
+            continue
+    if not samples:
+        raise RuntimeError("No samples for percentile estimation.")
+    allx = np.concatenate(samples)
+    lo, hi = np.percentile(allx, [p, 100.0 - p])
+    return float(lo), float(hi)
+
 def read_summary_csv(csv_path: Path):
     """
     Read summary_table.csv -> list of dict rows.
@@ -344,16 +367,22 @@ def main():
             lo_p, hi_p = (p, 100.0 - p)
             lo, hi = percentiles_from_samples(all_samples, lo_p, hi_p)
             # If 'global' and CSV has global_lo/hi, prefer them
+            # args.norm in {"none","absolute","global","auto"}  (example set)
             if args.norm == "global":
-                try:
-                    gl = rows[0].get("global_lo", None)
-                    gh = rows[0].get("global_hi", None)
-                    glv = parse_float(gl, None)
-                    ghv = parse_float(gh, None)
-                    if glv is not None and ghv is not None and ghv > glv:
-                        lo, hi = glv, ghv
-                except Exception:
-                    pass
+                # RESPECT --clip-percent: compute global percentiles from NPZ data
+                lo_used, hi_used = sample_npz_percentiles(
+                    npz_paths, p=float(args.clip_percent),
+                    sample_per_tile=args.sample_per_tile, seed=args.seed
+                )
+            elif args.norm == "absolute":
+                # fixed window user provided, e.g. --lo --hi
+                lo_used, hi_used = float(args.lo), float(args.hi)
+            elif args.norm == "auto":
+                # your existing auto logic (e.g., histogram-of-mosaic or robust fit)
+                lo_used, hi_used = auto_find_window(...)
+            else:  # "none"
+                lo_used, hi_used = global_min, global_max
+
             lo_used, hi_used = float(lo), float(hi)
             return
 

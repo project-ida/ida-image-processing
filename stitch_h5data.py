@@ -139,7 +139,7 @@ def apply_norm(img: pyvips.Image, fmt: str,
                mode: str, *, lo: float|None, hi: float|None,
                clip_percent: float, dfz: pd.DataFrame,
                per_tile: int, seed: int,
-               gamma: float, force_ushort: bool) -> tuple[pyvips.Image, float, float]:
+               gamma: float, force_ushort: bool) -> tuple[pyvips.Image, float, float, float, float]:
     in_lo, in_hi = fmt_range(fmt)
 
     if mode == "none":
@@ -174,8 +174,7 @@ def apply_norm(img: pyvips.Image, fmt: str,
     out_fmt = "ushort" if (force_ushort or mode == "absolute16") else fmt
     out_min, out_max = fmt_range(out_fmt)
     mapped = (num * (out_max - out_min) + out_min).cast(out_fmt)
-
-    return mapped, lo_used, hi_used
+    return mapped, lo_used, hi_used, out_min, out_max
 
 def preview_u8(img: pyvips.Image, lo: float|None, hi: float|None) -> pyvips.Image:
     if lo is None or hi is None or not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
@@ -332,7 +331,7 @@ def main():
 
         # --- normalize whole mosaic ---
         force_ushort = (args.norm == "absolute16")
-        mosaic, lo_used, hi_used = apply_norm(
+        mosaic, lo_used, hi_used, out_min, out_max = apply_norm(
             mosaic, probed_fmt, args.norm,
             lo=args.lo, hi=args.hi,
             clip_percent=args.clip_percent,
@@ -353,11 +352,9 @@ def main():
         # --- preview (8-bit) using SAME lo/hi ---
         s = min(1.0, args.preview_max / max(W, H))
         prv = mosaic.resize(s) if s < 1.0 else mosaic
-        prv8 = preview_u8(prv, lo_used, hi_used)
+        prv8 = preview_u8(prv, out_min, out_max)
         prv8.pngsave(str(prev_path), compression=6)
-        # integers, no scientific notation
-        print(f"✅ Preview PNG:   {prev_path}")
-        print(f"    Preview scale lo={int(round(lo_used))}, hi={int(round(hi_used))}")
+        print(f"    Preview scale lo={int(round(out_min))}, hi={int(round(out_max))}")
 
     print("All done.")
 

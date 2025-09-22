@@ -25,16 +25,13 @@ from tqdm.auto import tqdm
 
 # ---------- helpers ----------
 
-# --- add near top (helpers) ---
-import numpy as np
-
 def sample_npz_percentiles(npz_paths, p, sample_per_tile=5000, seed=0):
-    """Return (lo, hi) percentiles across all NPZ tiles."""
+    """Return (lo, hi) percentiles across *all* NPZ tiles."""
     rng = np.random.default_rng(seed)
     samples = []
     for pth in npz_paths:
         try:
-            a = np.load(pth)["sem_data"]
+            a = np.load(pth)["sem_data"]      # shape (H, W), dtype typically uint16/int16-ish
             a = a.astype(np.int32, copy=False).ravel()
             if sample_per_tile and a.size > sample_per_tile:
                 idx = rng.choice(a.size, sample_per_tile, replace=False)
@@ -43,7 +40,7 @@ def sample_npz_percentiles(npz_paths, p, sample_per_tile=5000, seed=0):
         except Exception:
             continue
     if not samples:
-        raise RuntimeError("No samples for percentile estimation.")
+        raise RuntimeError("No NPZ samples collected for percentile estimation.")
     allx = np.concatenate(samples)
     lo, hi = np.percentile(allx, [p, 100.0 - p])
     return float(lo), float(hi)
@@ -222,6 +219,11 @@ def main():
     csv_path = folder / "summary_table.csv"
     rows = read_summary_csv(csv_path)
 
+    # after you loaded summary_table.csv into df (or however you build the list)
+    npz_paths = [str(p) for p in df["npz_path"].dropna().tolist() if os.path.isfile(p)]
+    if not npz_paths:
+        raise SystemExit("No NPZ files found via 'npz_path' column.")
+  
     # Apply invert flags if present, then compute pixel placements
     # Choose units: X_rel_um / px_x_um -> pixel offsets
     Xum = []
@@ -350,43 +352,34 @@ def main():
     lo_used = g_min
     hi_used = g_max
 
-    def pick_lo_hi_from_norm():
-        nonlocal lo_used, hi_used
-        if args.norm == "none":
-            lo_used, hi_used = g_min, g_max
-            return
-        if args.norm == "absolute":
-            if args.lo is None or args.hi is None:
-                raise SystemExit("[error] --norm absolute requires --lo and --hi")
-            lo_used, hi_used = float(args.lo), float(args.hi)
-            return
-        if args.norm in ("scan", "auto", "global"):
-            # Start from samples (robust) …
-            all_samples = np.concatenate(samples) if samples else np.array([g_min, g_max], dtype=np.int32)
-            p = float(args.clip_percent)
-            lo_p, hi_p = (p, 100.0 - p)
-            lo, hi = percentiles_from_samples(all_samples, lo_p, hi_p)
-            # If 'global' and CSV has global_lo/hi, prefer them
-            # args.norm in {"none","absolute","global","auto"}  (example set)
-            if args.norm == "global":
-                # RESPECT --clip-percent: compute global percentiles from NPZ data
-                lo_used, hi_used = sample_npz_percentiles(
-                    npz_paths, p=float(args.clip_percent),
-                    sample_per_tile=args.sample_per_tile, seed=args.seed
-                )
-            elif args.norm == "absolute":
-                # fixed window user provided, e.g. --lo --hi
-                lo_used, hi_used = float(args.lo), float(args.hi)
-            elif args.norm == "auto":
-                # your existing auto logic (e.g., histogram-of-mosaic or robust fit)
-                lo_used, hi_used = auto_find_window(...)
-            else:  # "none"
-                lo_used, hi_used = global_min, global_max
+    def pick_lo_hi_from_norm(args, npz_paths, global_min, global_max):
+        norm = (args.norm or "none").lower()
+        if norm == "absolute":
+            # user-supplied fixed window (ensure in the correct order)
+            lo = float(args.lo) if args.lo is not None else global_min
+            hi = float(args.hi) if args.hi is not None else global_max
+            if hi < lo:
+                lo, hi = hi, lo
+            return lo, hi
+    
+        if norm == "global":
+            # <-- this is where --clip-percent must take effect
+            p = float(args.clip_percent or 1.0)
+            return sample_npz_percentiles(
+                npz_paths=npz_paths,
+                p=p,
+                sample_per_tile=getattr(args, "sample_per_tile", 5000),
+                seed=getattr(args, "seed", 0),
+            )
+    
+        if norm == "auto":
+            # keep whatever “auto” logic you already had, or fallback to global_min/max
+            return global_min, global_max
+    
+        # norm == "none" (or unknown): full raw range
+        return global_min, global_max
 
-            lo_used, hi_used = float(lo), float(hi)
-            return
-
-    pick_lo_hi_from_norm()
+    lo_used, hi_used = pick_lo_hi_from_norm(args, npz_paths, global_min, global_max)
 
     # preview
     out_png = out_dir / f"{folder.name.replace(' ', '_')}_Z0_preview.png"

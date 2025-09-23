@@ -2,7 +2,8 @@
 # one-time: pip install "pyvips[binary]" tqdm matplotlib
 # example:
 #   python dzi_from_bigtiff.py "/path/to/folder" --tile 512 --overlap 1 \
-#       --suffix jpg --jpeg-q 90 --split-channels false --workers 2 --show-hist
+#       --suffix jpg --jpeg-q 90 --split-channels false --workers 2 \
+#       --show-hist --norm percentile --clip-percent 1.0
 
 import os, re, time, argparse, math
 from pathlib import Path
@@ -21,27 +22,6 @@ plt = None
 def open_native(tif_path: Path) -> pyvips.Image:
     """Open BigTIFF with random access without type/colour changes."""
     return pyvips.Image.new_from_file(str(tif_path), access="random", page=0)
-
-def open_as_u8(tif_path: Path) -> pyvips.Image:
-    """
-    Open BigTIFF and coerce to 8-bit (what dzsave will get).
-    Leaves band count intact; sets sensible interpretation:
-      - 1 band  -> b-w
-      - 3+ bands -> srgb (if not already)
-    """
-    img = pyvips.Image.new_from_file(str(tif_path), access="random", page=0)
-    if img.format == "ushort":
-        img = (img >> 8).cast("uchar")
-    elif img.format != "uchar":
-        img = img.cast("uchar")
-    if img.bands == 1:
-        img = img.copy(interpretation="b-w")
-    elif img.bands >= 3 and img.interpretation != "srgb":
-        try:
-            img = img.colourspace("srgb")
-        except Exception:
-            img = img.copy(interpretation="srgb")
-    return img.copy_memory()
 
 # ---- numpy bridge for tiny vips images (histograms etc.) ---------------------
 _VIPS2NP = {
@@ -119,7 +99,8 @@ def plot_native_hist(img_native: pyvips.Image, title: str, out_png: Path, logy: 
 
     arr = _vips_to_numpy(band_s)[:, :, 0].astype("float32", copy=False)
     bins = min(4096, max(512, int(math.sqrt(arr.size))))
-    counts, edges = __import__("numpy").histogram(arr, bins=bins, range=(vmin, vmax))
+    import numpy as np
+    counts, edges = np.histogram(arr, bins=bins, range=(vmin, vmax))
     centers = 0.5 * (edges[:-1] + edges[1:])
 
     plt.figure(figsize=(9, 3.6))
@@ -149,6 +130,100 @@ def plot_u8_hist(img_u8: pyvips.Image, title: str, out_png: Path, logy: bool = T
     plt.xlabel("Value (0..255)")
     plt.ylabel("Count" + (" (log)" if logy else ""))
     plt.tight_layout(); plt.savefig(out_png, dpi=120); plt.close()
+
+# ---- percentile helpers (from histogram) -------------------------------------
+def percentile_from_hist(counts, lo_p, hi_p):
+    """Return (lo, hi) values (bin indices) for lo/hi percent from integer histogram."""
+    import numpy as np
+    c = counts.astype("float64")
+    s = c.sum()
+    if s <= 0:  # degenerate
+        return 0.0, float(len(counts) - 1)
+    cdf = np.cumsum(c) / s
+    lo = float(np.searchsorted(cdf, lo_p / 100.0, side="left"))
+    hi = float(np.searchsorted(cdf, 1.0 - hi_p / 100.0, side="left"))
+    hi = max(lo + 1.0, hi)
+    return lo, hi
+
+def choose_window(img: pyvips.Image, norm: str, clip_percent: float, lo_abs, hi_abs):
+    """
+    Decide lo/hi in the *native* domain.
+    - integer types: use exact hist_find() percentiles
+    - float/double: sample into numpy and use np.percentile
+    """
+    band0 = img.extract_band(0) if img.bands > 1 else img
+    fmt = band0.format
+
+    # fixed
+    if norm == "fixed":
+        if lo_abs is None or hi_abs is None:
+            raise SystemExit("[error] --norm fixed requires both --lo and --hi")
+        lo, hi = float(lo_abs), float(hi_abs)
+        if hi <= lo: lo, hi = hi, lo
+        return lo, hi, "fixed"
+
+    # minmax
+    if norm == "minmax":
+        lo, hi = float(band0.min()), float(band0.max())
+        if hi <= lo: hi = lo + 1.0
+        return lo, hi, "minmax"
+
+    # percentile (default)
+    if norm == "percentile":
+        p = float(clip_percent or 0.0)
+        # integers -> exact histogram
+        if fmt in ("uchar", "char", "ushort", "short", "uint", "int"):
+            h = band0.hist_find()
+            counts = _vips_to_numpy(h).reshape(-1)
+            lo, hi = percentile_from_hist(counts, p, p)
+            return lo, hi, f"percentile (±{p}%)"
+        # floats -> sample
+        try:
+            vmin, vmax = float(band0.min()), float(band0.max())
+        except Exception:
+            vmin, vmax = 0.0, 1.0
+        target = 4_000_000.0
+        scale = max((band0.width * band0.height) / target, 1.0)
+        band_s = band0.resize(1.0 / math.sqrt(scale)) if scale > 1.0 else band0
+        arr = _vips_to_numpy(band_s)[:, :, 0].astype("float32", copy=False)
+        import numpy as np
+        lo, hi = np.percentile(arr, [p, 100.0 - p])
+        if hi <= lo: hi = lo + 1.0
+        return float(lo), float(hi), f"percentile (±{p}%)"
+
+    # none: pass-through domain (will later cast/shift if ushort)
+    lo, hi = float(band0.min()), float(band0.max())
+    if hi <= lo: hi = lo + 1.0
+    return lo, hi, "none"
+
+# ---- map native -> u8 --------------------------------------------------------
+def map_to_u8(img_native: pyvips.Image, lo: float, hi: float) -> pyvips.Image:
+    """
+    Clip to [lo, hi] in native domain and scale to 0..255 (u8).
+    Works for 1-band or multi-band (applies same lo/hi to all).
+    """
+    if hi <= lo:
+        hi = lo + 1.0
+    # vectorize to all bands
+    band = img_native
+    # (x - lo)
+    band = band - lo
+    # clip to [0, hi-lo]
+    rng = hi - lo
+    band = band.clip(0, rng)
+    # scale to 0..255
+    band = band * (255.0 / rng)
+    band = band.cast("uchar")
+
+    # set interpretation
+    if band.bands == 1:
+        band = band.copy(interpretation="b-w")
+    elif band.bands >= 3 and band.interpretation != "srgb":
+        try:
+            band = band.colourspace("srgb")
+        except Exception:
+            band = band.copy(interpretation="srgb")
+    return band
 
 # ---- progress-enabled dzsave --------------------------------------------------
 def _safe_disconnect(img, handle):
@@ -208,6 +283,18 @@ def parse_args():
                    help="Export histograms: native input + u8 output")
     p.add_argument("--hist-logy", action=argparse.BooleanOptionalAction, default=True,
                    help="Use log scale on histogram Y axis (default true)")
+
+    # NEW: normalization to map native -> u8
+    p.add_argument("--norm",
+                   choices=["percentile", "minmax", "fixed", "none"],
+                   default="percentile",
+                   help="How to window native values before 8-bit mapping (default: percentile)")
+    p.add_argument("--clip-percent", type=float, default=1.0,
+                   help="Clip percent for --norm percentile (default 1.0)")
+    p.add_argument("--lo", type=float, default=None,
+                   help="Absolute lo for --norm fixed")
+    p.add_argument("--hi", type=float, default=None,
+                   help="Absolute hi for --norm fixed")
     return p.parse_args()
 
 # ---- main --------------------------------------------------------------------
@@ -235,6 +322,7 @@ def main():
         zlabel = m.group(1) if m else stem
 
         print(f"\n=== Processing {tif.name} ===")
+
         # PASS 1: open + quick scan
         print("  [PASS 1/3] Scanning input (native read, no coercion)...")
         img_native = open_native(tif)
@@ -257,14 +345,11 @@ def main():
             else:
                 print("    [note] native histogram not available; non-finite or unsupported type")
 
-        # PASS 2: map to 8-bit view (what dzsave will consume)
-        print("  [PASS 2/3] Coercing to 8-bit view (no further tone mapping here)...")
-        img8 = open_as_u8(tif)
-        try:
-            mn, mx = img8.min(), img8.max()
-            print(f"    u8 view range {mn}..{mx}, bands={img8.bands}")
-        except Exception:
-            pass
+        # Decide window and map to 8-bit
+        print("  [PASS 2/3] Computing window + mapping to 8-bit for DZI...")
+        lo, hi, why = choose_window(img_native, args.norm, args.clip_percent, args.lo, args.hi)
+        print(f"    → u8 mapping: lo={int(round(lo))}, hi={int(round(hi))} (norm={why})")
+        img8 = map_to_u8(img_native, lo, hi)
 
         if args.show_hist:
             out_png = out_dir / f"{stem}_hist_output_u8.png"

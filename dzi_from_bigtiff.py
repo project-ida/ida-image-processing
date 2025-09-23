@@ -137,7 +137,7 @@ def percentile_from_hist(counts, lo_p, hi_p):
     import numpy as np
     c = counts.astype("float64")
     s = c.sum()
-    if s <= 0:  # degenerate
+    if s <= 0:
         return 0.0, float(len(counts) - 1)
     cdf = np.cumsum(c) / s
     lo = float(np.searchsorted(cdf, lo_p / 100.0, side="left"))
@@ -171,7 +171,6 @@ def choose_window(img: pyvips.Image, norm: str, clip_percent: float, lo_abs, hi_
     # percentile (default)
     if norm == "percentile":
         p = float(clip_percent or 0.0)
-        # integers -> exact histogram
         if fmt in ("uchar", "char", "ushort", "short", "uint", "int"):
             h = band0.hist_find()
             counts = _vips_to_numpy(h).reshape(-1)
@@ -191,31 +190,31 @@ def choose_window(img: pyvips.Image, norm: str, clip_percent: float, lo_abs, hi_
         if hi <= lo: hi = lo + 1.0
         return float(lo), float(hi), f"percentile (±{p}%)"
 
-    # none: pass-through domain (will later cast/shift if ushort)
+    # none
     lo, hi = float(band0.min()), float(band0.max())
     if hi <= lo: hi = lo + 1.0
     return lo, hi, "none"
 
-# ---- map native -> u8 --------------------------------------------------------
+# ---- map native -> u8 (robust, no 'clip' op required) ------------------------
 def map_to_u8(img_native: pyvips.Image, lo: float, hi: float) -> pyvips.Image:
     """
     Clip to [lo, hi] in native domain and scale to 0..255 (u8).
-    Works for 1-band or multi-band (applies same lo/hi to all).
+    Portable implementation using mask + ifthenelse (works on older libvips).
     """
     if hi <= lo:
         hi = lo + 1.0
-    # vectorize to all bands
-    band = img_native
-    # (x - lo)
-    band = band - lo
-    # clip to [0, hi-lo]
+
     rng = hi - lo
-    band = band.clip(0, rng)
-    # scale to 0..255
+    band = img_native - lo                      # shift
+    # clamp low: if band < 0 -> 0 else band
+    band = (band < 0).ifthenelse(0, band)
+    # clamp high: if band > rng -> rng else band
+    band = (band > rng).ifthenelse(rng, band)
+    # scale to 0..255 and cast
     band = band * (255.0 / rng)
     band = band.cast("uchar")
 
-    # set interpretation
+    # interpretation
     if band.bands == 1:
         band = band.copy(interpretation="b-w")
     elif band.bands >= 3 and band.interpretation != "srgb":

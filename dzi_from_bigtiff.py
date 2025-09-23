@@ -69,63 +69,76 @@ def _lazy_import_matplotlib(backend_agg: bool = True):
         import matplotlib.pyplot as _plt
         plt = _plt
 
-def plot_native_hist(img_native: pyvips.Image, title: str, out_png: Path,
-                     logy: bool = True, float_bins: int = 2048) -> None:
+def plot_native_hist(img_native: pyvips.Image, title: str, logy: bool = True) -> bool:
     """
-    Plot histogram in the image's native domain and save to out_png.
-    - For integer images -> exact integer histogram via vips.hist_find()
-    - For float images:
-        * If finite range within 0..65535, cast a COPY to ushort and use exact 0..65535
-        * Else, bin to 'float_bins' bins using numpy
+    Plot histogram in the image's native domain.
+    - For integer images, use vips.hist_find() (exact integer bins).
+    - For non-integer (float/double), bin between observed min..max.
+    Returns True if we produced a native-domain plot.
     """
-    _lazy_import_matplotlib()
+    import numpy as np
+    import matplotlib.pyplot as plt
 
     band0 = img_native.extract_band(0) if img_native.bands > 1 else img_native
-    use_exact = band0.format in ("uchar","char","ushort","short","uint","int")
-    xlab = ""
-    xs = None
+    fmt = band0.format
 
-    if use_exact:
+    # Integer types -> exact integer histogram
+    if fmt in ("uchar","char","ushort","short","uint","int"):
         h = band0.hist_find()
         counts = _vips_to_numpy(h).reshape(-1)
         xs = np.arange(counts.size)
-        if band0.format in ("uchar","char"):
-            xlab = "Value (0..255)"; xlim = (0, 255)
-        elif band0.format in ("ushort","short"):
-            xlab = "Value (0..65535)"; xlim = (0, 65535)
+        if fmt == "ushort":
+            xlab = "Value (0..65535)"
+        elif fmt == "uchar":
+            xlab = "Value (0..255)"
         else:
-            xlab = "Value index"; xlim = None
-    else:
-        # float path
-        vmin = float(band0.min())
-        vmax = float(band0.max())
-        if np.isfinite([vmin, vmax]).all() and 0.0 <= vmin and vmax <= 65535.0:
-            h = band0.cast("ushort").hist_find()
-            counts = _vips_to_numpy(h).reshape(-1)
-            xs = np.arange(counts.size)
-            xlab = "Value (0..65535)"; xlim = (0, 65535)
-        else:
-            arr = _vips_to_numpy(band0)[:, :, 0]
-            counts, edges = np.histogram(arr, bins=int(float_bins))
-            xs = 0.5 * (edges[:-1] + edges[1:])
-            xlab = f"Scaled bin (0..{float_bins-1})"
-            xlim = None
-
-    plt.figure(figsize=(9, 3.5))
-    plt.bar(xs, counts, width=1.0 if np.issubdtype(type(xs[0]), np.integer) else None)
-    if logy:
-        plt.yscale("log")
-    plt.title(title)
-    plt.xlabel(xlab)
-    plt.ylabel("Count" + (" (log)" if logy else ""))
-    if xlim:
-        plt.xlim(*xlim)
-    plt.tight_layout()
-    plt.savefig(out_png, dpi=110)
-    try:
+            # signed/other ints: show the actual span we see
+            try:
+                vmin, vmax = int(band0.min()), int(band0.max())
+            except Exception:
+                vmin, vmax = 0, counts.size - 1
+            xlab = f"Value (observed {vmin}..{vmax})"
+        plt.figure(figsize=(8, 3.5))
+        plt.bar(xs, counts, width=1.0)
+        if logy: plt.yscale("log")
+        plt.title(title)
+        plt.xlabel(xlab); plt.ylabel("Count" + (" (log)" if logy else ""))
+        plt.tight_layout(); plt.savefig(f"{Path(title.split()[-1]).stem}_hist_input_native.png", dpi=120)
         plt.close()
+        return True
+
+    # Float/double -> bin over observed range (no hard-coded 0..65535)
+    try:
+        vmin, vmax = float(band0.min()), float(band0.max())
     except Exception:
-        pass
+        return False
+    if not np.isfinite([vmin, vmax]).all() or vmax <= vmin:
+        return False
+
+    # Pull a downsampled view to keep it light
+    # (shrink to ~4 MP if huge)
+    scale = max(band0.width * band0.height / (4_000_000.0), 1.0)
+    if scale > 1.0:
+        f = 1.0 / math.sqrt(scale)
+        band_s = band0.resize(f)  # area/nearest-ish is fine for hist
+    else:
+        band_s = band0
+
+    arr = _vips_to_numpy(band_s)[:, :, 0].astype(np.float32, copy=False)
+    bins = min(4096, max(512, int(math.sqrt(arr.size))))  # adaptive bins
+    counts, edges = np.histogram(arr, bins=bins, range=(vmin, vmax))
+    centers = 0.5 * (edges[:-1] + edges[1:])
+
+    plt.figure(figsize=(8, 3.5))
+    plt.plot(centers, counts, drawstyle="steps-mid")
+    if logy: plt.yscale("log")
+    plt.title(f"{title}  ({fmt}, bins={bins})")
+    plt.xlabel(f"Value ({vmin:.3g}..{vmax:.3g})")
+    plt.ylabel("Count" + (" (log)" if logy else ""))
+    plt.tight_layout()
+    plt.savefig(f"{Path(title.split()[-1]).stem}_hist_input_native.png", dpi=120)
+    plt.close()
+    return True
 
 def plot_u8_hist(img_u8: pyvips.Image, title: str, out_png: Path, logy: bool = True) -> None:
     """Exact 8-bit histogram with fixed 0..255 axis; save to out_png."""

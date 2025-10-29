@@ -9,6 +9,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import Iterable
 from ndstorage import Dataset
+from typing import Optional
 
 # ---------- fixed config ----------
 POLL_SECONDS   = 60                      # check once per minute
@@ -23,6 +24,7 @@ BASE_DIR: Path
 SCALE: str
 CHANNEL: str
 MASTER_LOG_PATH: Path
+DZI_DEST: Optional[Path]
 
 def ts() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -59,10 +61,11 @@ def list_candidate_datasets_recursive(base: Path) -> Iterable[Path]:
         if INDEX_NAME in files and LOG_NAME not in files:
             yield Path(root)
 
-def run_processing(ds_dir: Path, script_dir: Path) -> bool:
+def run_processing(ds_dir: Path, script_dir: Path, dzi_destination_dir: Optional[Path] = None) -> bool:
     """Run the two steps; return True on success."""
     stitch_script = script_dir / "stitch_ndtiff.py"
     dzi_script    = script_dir / "dzi_from_bigtiff.py"
+    moving_script    = script_dir / "move_dzi.py"
 
     # Step 1: stitch
     cmd1 = [sys.executable, str(stitch_script), str(ds_dir), "--scale", SCALE, "--channel", CHANNEL]
@@ -82,6 +85,19 @@ def run_processing(ds_dir: Path, script_dir: Path) -> bool:
     except subprocess.CalledProcessError as e:
         log_ds(ds_dir, f"ERROR: dzi_from_bigtiff failed with code {e.returncode}")
         return False
+    
+    if dzi_destination_dir is not None:
+        # Step 3: move DZIs
+        dzi_origin_dir = stitched_dir
+        cmd3 = [sys.executable, str(moving_script), "--dzi-origin", str(dzi_origin_dir), "--dzi-destination", str(dzi_destination_dir), "--use-greatgrandparent-folder-name"]
+        log_ds(ds_dir, f"Running: {' '.join(cmd3)}")
+        try:
+            subprocess.run(cmd3, check=True)
+        except subprocess.CalledProcessError as e:
+            log_ds(ds_dir, f"ERROR: move_dzi failed with code {e.returncode}")
+            return False
+    
+
 
     return True
 
@@ -90,15 +106,17 @@ def parse_args():
     ap.add_argument("--base-dir", required=True, help="Root folder to scan recursively for NDTiff datasets")
     ap.add_argument("--scale", default="1.0", help="Scale passed to stitch_ndtiff.py (default: 1.0)")
     ap.add_argument("--channel", default="g", help="Channel passed to stitch_ndtiff.py (default: g)")
+    ap.add_argument("--dzi-destination", required=False, help="Optional destination folder for DZIs")
     return ap.parse_args()
 
 def main():
-    global BASE_DIR, SCALE, CHANNEL, MASTER_LOG_PATH
+    global BASE_DIR, SCALE, CHANNEL, DZI_DEST, MASTER_LOG_PATH
 
     args = parse_args()
     BASE_DIR = Path(args.base_dir)
     SCALE = args.scale
     CHANNEL = args.channel
+    DZI_DEST = Path(args.dzi_destination) if args.dzi_destination else None
 
     if not BASE_DIR.exists():
         print(f"Base folder does not exist: {BASE_DIR}")
@@ -107,7 +125,7 @@ def main():
     MASTER_LOG_PATH = BASE_DIR / "watcher.log"
     script_dir = Path(__file__).resolve().parent
 
-    log_master(f"Watching (recursive) {BASE_DIR} (scripts in {script_dir}) | scale={SCALE} channel={CHANNEL}")
+    log_master(f"Watching (recursive) {BASE_DIR} (scripts in {script_dir}) | scale={SCALE} channel={CHANNEL} dzi-destination={DZI_DEST}")
 
     while True:
         try:
@@ -124,7 +142,7 @@ def main():
 
                 # Start processing (creating the dataset log now enables the 'delete to retry' behavior)
                 log_ds(ds, "Processing started.")
-                ok = run_processing(ds, script_dir)
+                ok = run_processing(ds, script_dir, DZI_DEST)
                 if ok:
                     log_ds(ds, "Processing complete.")
                 else:

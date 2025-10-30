@@ -212,5 +212,8 @@ __marimo__/
 # All image files
 *.png
 
+# Don't commit archive
+archive/
+
 # Mac OS
 .DS_Store

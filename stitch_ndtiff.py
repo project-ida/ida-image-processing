@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, math, argparse
+import os, math, argparse, shutil
 from pathlib import Path
 
 # enable libvips progress + set workers BEFORE importing pyvips
@@ -24,11 +24,41 @@ def must_have_columns(df: pd.DataFrame) -> pd.DataFrame:
         df["Z_layer"] = 0
     return df
 
-def parse_px_um_from_affine(summary) -> tuple[float,float]:
-    # summary['UserData']['AffineTransform']['scalar'] is like "0.2_0.0_0.0_-0.2"
-    affine = summary["UserData"]["AffineTransform"]["scalar"]
-    ax, _bx, _by, dy = map(float, affine.split("_"))
-    return abs(ax), abs(dy)  # µm/px in X and Y
+def parse_px_um_from_affine(summary) -> tuple[float, float] | tuple[None, None]:
+    """
+    Try to read µm/px from Micro-Manager-style metadata:
+      summary['UserData']['AffineTransform']['scalar'] == "ax_bx_by_dy"
+    Returns (px_x_um, px_y_um) or (None, None) on failure.
+    """
+    try:
+        affine = summary["UserData"]["AffineTransform"]["scalar"]
+        ax, _bx, _by, dy = map(float, str(affine).split("_"))
+        return abs(ax), abs(dy)
+    except Exception:
+        return None, None
+
+def resolve_px_um(summary, arg_px_x_um, arg_px_y_um) -> tuple[float, float]:
+    """
+    Resolve pixel size (µm/px) from metadata or CLI args.
+    On failure, print the requested message and exit(1).
+    """
+    px_x_um, px_y_um = parse_px_um_from_affine(summary)
+
+    # If metadata missing/invalid, prefer CLI values
+    if px_x_um is None or px_y_um is None:
+        if arg_px_x_um is not None and arg_px_y_um is not None:
+            return float(arg_px_x_um), float(arg_px_y_um)
+        # Required failure message
+        print("px_x_um and/or px_y_um information not found in the metadata. "
+              "If you know this information, we can proceed by you entering it as parameters "
+              "--px_x_um and --px_y_um")
+        raise SystemExit(1)
+
+    # If metadata present but user provided overrides, honor overrides if both given
+    if arg_px_x_um is not None and arg_px_y_um is not None:
+        return float(arg_px_x_um), float(arg_px_y_um)
+
+    return px_x_um, px_y_um
 
 def load_tile_pos_z(images, pos_index: int, z_layer: int) -> np.ndarray:
     """
@@ -71,7 +101,6 @@ def feather_mask_vips(w: int, h: int, fpx: int) -> pyvips.Image:
         return wm
     xy = pyvips.Image.xyz(w, h)
     X, Y = xy[0].cast("float"), xy[1].cast("float")
-    # distance to nearest vertical/horizontal edge (no min() op available, use conditionals)
     dx = (X < (w - 1 - X)).ifthenelse(X, (w - 1 - X))
     dy = (Y < (h - 1 - Y)).ifthenelse(Y, (h - 1 - Y))
     d  = (dx < dy).ifthenelse(dx, dy)
@@ -81,7 +110,7 @@ def feather_mask_vips(w: int, h: int, fpx: int) -> pyvips.Image:
     _mask_cache[key] = wm
     return wm
 
-# ---- new robust helpers ----
+# ---- robust helpers ----
 def expected_tile_px(df_row, um_per_px_x, um_per_px_y):
     """Return expected (w,h) in px if TileWidth_um/TileHeight_um exist, else None."""
     tw = getattr(df_row, "TileWidth_um", None)
@@ -111,29 +140,23 @@ def load_tile_pos_z_safe(images, pos_index: int, z_layer: int, single_band: bool
             pass
         a = np.asarray(a)
 
-        # squeeze leading singleton dims (dask sometimes gives [1,H,W,C])
         while a.ndim > 3 and a.shape[0] == 1:
             a = a[0]
 
-        # Normalize to channels
         if a.ndim == 2:
-            # grayscale source
             if single_band:
                 pass  # keep (H,W)
             else:
                 a = np.repeat(a[..., None], 3, axis=2)
         else:
-            # assume last dim is channels
             if a.shape[-1] == 4:
                 a = a[..., :3]
             if single_band:
                 if a.shape[-1] >= 3:
                     a = a[..., band_idx]  # -> (H,W)
                 else:
-                    # unexpected bands; bail
                     return None
 
-        # Sanity check size (±5 px tolerance)
         if exp_wh is not None:
             aw = a.shape[1]
             ah = a.shape[0]
@@ -168,6 +191,10 @@ def main():
         default="rgb",
         help="Export full RGB (default) or a single channel (r/g/b) as 1-band grayscale",
     )
+    # NEW: optional pixel size overrides (µm/px)
+    ap.add_argument("--px_x_um", type=float, default=None, help="Override pixel size along X in µm/px")
+    ap.add_argument("--px_y_um", type=float, default=None, help="Override pixel size along Y in µm/px")
+
     args = ap.parse_args()
 
     os.environ["VIPS_CONCURRENCY"] = str(args.vips_workers)
@@ -181,10 +208,7 @@ def main():
         raise SystemExit(f"Missing file: {csv_path}")
 
     # Default out dir: <dataset>/stitched
-    if args.out_dir is None:
-        out_dir = ndpath / "stitched"
-    else:
-        out_dir = Path(args.out_dir)
+    out_dir = Path(args.out_dir) if args.out_dir else (ndpath / "stitched")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Base name for outputs: dataset folder name
@@ -195,7 +219,8 @@ def main():
     images = ds.as_array()
     summary = ds.summary_metadata
 
-    px_x_um, px_y_um = parse_px_um_from_affine(summary)
+    # --- resolve pixel size (with graceful fallback to CLI & user message) ---
+    px_x_um, px_y_um = resolve_px_um(summary, args.px_x_um, args.px_y_um)
     um_to_px_x = lambda um: um / px_x_um
     um_to_px_y = lambda um: um / px_y_um
 
@@ -228,6 +253,15 @@ def main():
     single_band = args.channel != "rgb"
     band_idx    = {"r": 0, "g": 1, "b": 2}.get(args.channel, None) if single_band else None
 
+    # (Optional) space info
+    try:
+        tmp_dir = Path(os.environ.get("VIPS_TMPDIR") or os.environ.get("TMP") or os.environ.get("TEMP") or ".")
+        _, _, out_free = shutil.disk_usage(out_dir)
+        _, _, tmp_free = shutil.disk_usage(tmp_dir)
+        print(f"[info] Free space -> out: {out_free/1024**3:.1f} GB, tmp: {tmp_free/1024**3:.1f} GB (TMP={tmp_dir})")
+    except Exception:
+        pass
+
     for z in range(S):
         dfz = df[df["Z_layer"] == z]
         if dfz.empty:
@@ -259,10 +293,7 @@ def main():
             a_probe = load_tile_pos_z_safe(images, pos_probe, z, single_band, band_idx, exp_wh=exp)
             if a_probe is None:
                 continue
-            if a_probe.dtype == np.uint16:
-                fmt = "ushort"
-            else:
-                fmt = "uchar"
+            fmt = "ushort" if a_probe.dtype == np.uint16 else "uchar"
             probe_done = True
             break
         if not probe_done:
@@ -287,7 +318,6 @@ def main():
                 a   = load_tile_pos_z_safe(images, pos, z, single_band, band_idx, exp_wh=exp)
                 if a is None:
                     bad_tiles += 1
-                    # optional: insert nothing (stays background after normalization)
                     continue
 
                 # numpy -> vips
@@ -302,7 +332,7 @@ def main():
                     h, w = a.shape
                     t = pyvips.Image.new_from_memory(np.ascontiguousarray(a).data, w, h, 1, fmt).copy(interpretation="b-w")
                 else:
-                    if a.ndim == 2:  # grayscale but RGB requested -> expand
+                    if a.ndim == 2:
                         a = np.repeat(a[..., None], 3, axis=2)
                     h, w, c = a.shape
                     t = pyvips.Image.new_from_memory(np.ascontiguousarray(a).data, w, h, c, fmt).copy(interpretation="srgb")
@@ -360,7 +390,7 @@ def main():
                     h, w = a.shape
                     t = pyvips.Image.new_from_memory(np.ascontiguousarray(a).data, w, h, 1, fmt).copy(interpretation="b-w")
                 else:
-                    if a.ndim == 2:  # grayscale but RGB requested -> expand
+                    if a.ndim == 2:
                         a = np.repeat(a[..., None], 3, axis=2)
                     h, w, c = a.shape
                     t = pyvips.Image.new_from_memory(np.ascontiguousarray(a).data, w, h, c, fmt).copy(interpretation="srgb")
@@ -399,3 +429,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

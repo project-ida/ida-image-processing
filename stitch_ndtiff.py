@@ -194,6 +194,12 @@ def main():
     # NEW: optional pixel size overrides (µm/px)
     ap.add_argument("--px_x_um", type=float, default=None, help="Override pixel size along X in µm/px")
     ap.add_argument("--px_y_um", type=float, default=None, help="Override pixel size along Y in µm/px")
+    # NEW: rotation (degrees, +CCW)
+    ap.add_argument(
+        "--rotate", type=float, default=0.0,
+        help="Rotate the final mosaic by this many degrees (positive = counter-clockwise). "
+             "Applied to the saved TIFF and preview."
+    )
 
     args = ap.parse_args()
 
@@ -273,15 +279,20 @@ def main():
 
         if tiff_path.exists() and not args.overwrite:
             print(f"[skip] {tiff_path} exists.")
-            if not prev_path.exists():
-                try:
-                    im = pyvips.Image.new_from_file(str(tiff_path), access="sequential")
-                    s = min(1.0, args.preview_max / max(im.width, im.height))
-                    prv = im.resize(s) if s < 1.0 else im
-                    prv.pngsave(str(prev_path), compression=6)
-                    print(f"✅ Preview (from existing): {prev_path}")
-                except Exception as e:
-                    print(f"[warn] cannot create preview from existing TIFF: {e}")
+            try:
+                im = pyvips.Image.new_from_file(str(tiff_path), access="sequential")
+                # If a rotation was requested but we skipped writing, rotate preview so you can inspect it.
+                if abs(args.rotate) > 1e-6:
+                    interp = pyvips.Interpolate.new("bilinear")
+                    bg = [bgval] if im.bands == 1 else bg_rgb
+                    im = im.similarity(angle=float(args.rotate), interpolate=interp, background=bg)
+                    print("[note] Preview is rotated, but TIFF on disk is not. Use --overwrite to regenerate TIFF with rotation.")
+                s = min(1.0, args.preview_max / max(im.width, im.height))
+                prv = im.resize(s) if s < 1.0 else im
+                prv.pngsave(str(prev_path), compression=6)
+                print(f"✅ Preview (from existing): {prev_path}")
+            except Exception as e:
+                print(f"[warn] cannot create preview from existing TIFF: {e}")
             continue
 
         # Probe bit depth from the first *valid* tile of this Z
@@ -409,6 +420,13 @@ def main():
         except Exception:
             pass
 
+        # ---- NEW: apply rotation before saving / preview ----
+        if abs(args.rotate) > 1e-6:
+            interp = pyvips.Interpolate.new("bilinear")
+            bg = [bgval] if save_im.bands == 1 else bg_rgb
+            save_im = save_im.similarity(angle=float(args.rotate), interpolate=interp, background=bg)
+            print(f"[info] Applied rotation: {args.rotate:.3f}° (positive = CCW)")
+
         save_im.tiffsave(
             str(tiff_path),
             tile=True,
@@ -419,8 +437,9 @@ def main():
         )
         print(f"✅ BigTIFF written: {tiff_path}")
 
-        # preview
-        s = min(1.0, args.preview_max / max(W, H))
+        # preview (based on the rotated image if rotation was requested)
+        W_out, H_out = save_im.width, save_im.height
+        s = min(1.0, args.preview_max / max(W_out, H_out))
         prv = save_im.resize(s) if s < 1.0 else save_im
         prv.pngsave(str(prev_path), compression=6)
         print(f"✅ Preview PNG:   {prev_path}")
@@ -429,4 +448,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

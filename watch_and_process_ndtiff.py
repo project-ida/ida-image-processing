@@ -7,13 +7,12 @@ import argparse
 import subprocess
 from pathlib import Path
 from datetime import datetime
-from typing import Iterable
+from typing import Iterable, Optional
 from ndstorage import Dataset
-from typing import Optional
 
 # ---------- fixed config ----------
 POLL_SECONDS   = 60                      # check once per minute
-GRACE_AFTER_FINISH_SECONDS = 5          # wait after is_finished() before processing
+GRACE_AFTER_FINISH_SECONDS = 5           # wait after is_finished() before processing
 INDEX_NAME     = "NDTiff.index"          # identifies a dataset root
 LOG_NAME       = "auto_process.log"      # per-dataset log (presence gates processing)
 WRITE_MASTER_LOG = True                  # also keep one global log in BASE_DIR
@@ -51,6 +50,7 @@ def log_ds(ds_dir: Path, msg: str) -> None:
         except Exception:
             pass
 
+
 def list_candidate_datasets_recursive(base: Path) -> Iterable[Path]:
     """
     Recursively yield dataset roots: folders with NDTiff.index and without auto_process.log.
@@ -61,14 +61,36 @@ def list_candidate_datasets_recursive(base: Path) -> Iterable[Path]:
         if INDEX_NAME in files and LOG_NAME not in files:
             yield Path(root)
 
+def read_rotation_arg(ds_dir: Path) -> list[str]:
+    """
+    If <ds_dir>/rotation.txt exists, read the first line as a float (degrees).
+    Return ["--rotate", "<value>"] on success, else [].
+    """
+    rot_path = ds_dir / "rotation.txt"
+    if not rot_path.exists():
+        return []
+    try:
+        first_line = rot_path.read_text(encoding="utf-8").strip().splitlines()[0].strip()
+        val = float(first_line)
+        return ["--rotate", str(val)]
+    except Exception as e:
+        log_ds(ds_dir, f"rotation.txt present but not usable ({e}); continuing without rotation.")
+        return []
+
 def run_processing(ds_dir: Path, script_dir: Path, dzi_destination_dir: Optional[Path] = None) -> bool:
-    """Run the two steps; return True on success."""
+    """Run the steps; return True on success."""
     stitch_script = script_dir / "stitch_ndtiff.py"
     dzi_script    = script_dir / "dzi_from_bigtiff.py"
-    moving_script    = script_dir / "move_dzi.py"
+    moving_script = script_dir / "move_dzi.py"
+
+    # Optional rotation argument from rotation.txt
+    rotate_args = read_rotation_arg(ds_dir)
+    if rotate_args:
+        log_ds(ds_dir, f"Using rotation from rotation.txt: {rotate_args[1]} degrees")
 
     # Step 1: stitch
-    cmd1 = [sys.executable, str(stitch_script), str(ds_dir), "--scale", SCALE, "--channel", CHANNEL]
+    cmd1 = [sys.executable, str(stitch_script), str(ds_dir),
+            "--scale", SCALE, "--channel", CHANNEL, *rotate_args]
     log_ds(ds_dir, f"Running: {' '.join(cmd1)}")
     try:
         subprocess.run(cmd1, check=True)
@@ -85,19 +107,23 @@ def run_processing(ds_dir: Path, script_dir: Path, dzi_destination_dir: Optional
     except subprocess.CalledProcessError as e:
         log_ds(ds_dir, f"ERROR: dzi_from_bigtiff failed with code {e.returncode}")
         return False
-    
+
+    # Step 3: move DZIs (optional)
     if dzi_destination_dir is not None:
-        # Step 3: move DZIs
         dzi_origin_dir = stitched_dir
-        cmd3 = [sys.executable, str(moving_script), "--dzi-origin", str(dzi_origin_dir), "--dzi-destination", str(dzi_destination_dir), "--use-greatgrandparent-folder-name"]
+        cmd3 = [
+            sys.executable, str(moving_script),
+            "--dzi-origin", str(dzi_origin_dir),
+            "--dzi-destination", str(dzi_destination_dir),
+            "--use-greatgrandparent-folder-name",
+            "--overwrite",
+        ]
         log_ds(ds_dir, f"Running: {' '.join(cmd3)}")
         try:
             subprocess.run(cmd3, check=True)
         except subprocess.CalledProcessError as e:
             log_ds(ds_dir, f"ERROR: move_dzi failed with code {e.returncode}")
             return False
-    
-
 
     return True
 
@@ -125,7 +151,10 @@ def main():
     MASTER_LOG_PATH = BASE_DIR / "watcher.log"
     script_dir = Path(__file__).resolve().parent
 
-    log_master(f"Watching (recursive) {BASE_DIR} (scripts in {script_dir}) | scale={SCALE} channel={CHANNEL} dzi-destination={DZI_DEST}")
+    log_master(
+        f"Watching (recursive) {BASE_DIR} (scripts in {script_dir}) | "
+        f"scale={SCALE} channel={CHANNEL} dzi-destination={DZI_DEST}"
+    )
 
     while True:
         try:

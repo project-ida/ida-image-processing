@@ -69,7 +69,17 @@ def main():
     args = ap.parse_args()
 
     in_dir = os.path.abspath(args.input_folder)
-    out_path = args.output or os.path.join(in_dir, "selection_grid.json")
+    
+    if args.output:
+    # User explicitly set an output path
+    out_path = args.output
+    else:
+        # Default behaviour:
+        #   ../overlays/selection_grid.json
+        parent = os.path.dirname(in_dir)
+        overlay_dir = os.path.join(parent, "overlays")
+        os.makedirs(overlay_dir, exist_ok=True)
+        out_path = os.path.join(overlay_dir, "selection_grid.json")
 
     files = sorted(glob(os.path.join(in_dir, "*.json")))
     if not files:

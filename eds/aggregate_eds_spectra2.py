@@ -70,7 +70,7 @@ def main():
                 "TileHeight_um": float(row["TileHeight_um"]),
             }
 
-    out_dir = root / f"aggregated-spectra_{args.rows}x{args.cols}_json"
+    out_dir = root / f"aggregated-spectra"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     npz_files = sorted(root.rglob("*_eds.npz"))

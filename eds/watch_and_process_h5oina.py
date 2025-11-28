@@ -128,9 +128,12 @@ def run_processing(
     # Layout:
     #   watcher + stitch_h5data.py live in the same folder (script_dir)
     #   dzi_from_bigtiff.py and move_dzi.py live in the parent folder
-    stitch_script = script_dir / "stitch_h5data.py"
-    dzi_script    = script_dir.parent / "dzi_from_bigtiff.py"
-    moving_script = script_dir.parent / "move_dzi.py"
+    stitch_script         = script_dir / "stitch_h5data.py"
+    dzi_script            = script_dir.parent / "dzi_from_bigtiff.py"
+    selection_grid_script = script_dir / "create_selection_grid.py"
+    metric_grid_script    = script_dir.parent / "create_metric_grid.py"
+    stitching_grid_script = script_dir.parent / "create_stitching_grid.py"
+    moving_script         = script_dir.parent / "move_dzi.py"
 
     # Optional rotation argument from rotation.txt (per dataset)
     rotate_args = read_rotation_arg(ds_dir, dry_run=dry_run)
@@ -170,6 +173,53 @@ def run_processing(
             return False
     else:
         log_ds(ds_dir, "DRY-RUN: Skipping execution of dzi_from_bigtiff.py", dry_run=dry_run)
+
+    # Step 2.5: create overlay grids
+    # selection_grid
+    sel_input = ds_dir / "aggregated-spectra"
+    cmd_sel = [
+        sys.executable, str(selection_grid_script),
+        str(sel_input)
+    ]
+    log_msg = f"Would run: {' '.join(cmd_sel)}" if dry_run else f"Running: {' '.join(cmd_sel)}"
+    log_ds(ds_dir, log_msg, dry_run=dry_run)
+    if not dry_run:
+        try:
+            subprocess.run(cmd_sel, check=True)
+        except subprocess.CalledProcessError as e:
+            log_ds(ds_dir, f"ERROR: create_selection_grid failed with code {e.returncode}", dry_run=dry_run)
+    else:
+        log_ds(ds_dir, "DRY-RUN: Skipping execution of create_selection_grid.py", dry_run=dry_run)
+
+    # metric_grid
+    cmd_metric = [
+        sys.executable, str(metric_grid_script),
+        str(ds_dir)
+    ]
+    log_msg = f"Would run: {' '.join(cmd_metric)}" if dry_run else f"Running: {' '.join(cmd_metric)}"
+    log_ds(ds_dir, log_msg, dry_run=dry_run)
+    if not dry_run:
+        try:
+            subprocess.run(cmd_metric, check=True)
+        except subprocess.CalledProcessError as e:
+            log_ds(ds_dir, f"ERROR: create_metric_grid failed with code {e.returncode}", dry_run=dry_run)
+    else:
+        log_ds(ds_dir, "DRY-RUN: Skipping execution of create_metric_grid.py", dry_run=dry_run)
+
+    # stitching_grid
+    cmd_stitching = [
+        sys.executable, str(stitching_grid_script),
+        str(ds_dir)
+    ]
+    log_msg = f"Would run: {' '.join(cmd_stitching)}" if dry_run else f"Running: {' '.join(cmd_stitching)}"
+    log_ds(ds_dir, log_msg, dry_run=dry_run)
+    if not dry_run:
+        try:
+            subprocess.run(cmd_stitching, check=True)
+        except subprocess.CalledProcessError as e:
+            log_ds(ds_dir, f"ERROR: create_stitching_grid failed with code {e.returncode}", dry_run=dry_run)
+    else:
+        log_ds(ds_dir, "DRY-RUN: Skipping execution of create_stitching_grid.py", dry_run=dry_run)
 
     # Step 3: move DZIs
     if dzi_destination_dir is not None:

@@ -71,7 +71,7 @@ def read_rotation_arg(ds_dir: Path) -> list[str]:
         return []
     try:
         first_line = rot_path.read_text(encoding="utf-8").strip().splitlines()[0].strip()
-        val = float(first_line)
+        val = -float(first_line)
         return ["--rotate", str(val)]
     except Exception as e:
         log_ds(ds_dir, f"rotation.txt present but not usable ({e}); continuing without rotation.")
@@ -90,7 +90,7 @@ def run_processing(ds_dir: Path, script_dir: Path, dzi_destination_dir: Optional
 
     # Step 1: stitch
     cmd1 = [sys.executable, str(stitch_script), str(ds_dir),
-            "--scale", SCALE, "--channel", CHANNEL, *rotate_args]
+            "--scale", SCALE, "--channel", CHANNEL, *rotate_args, "--overwrite"]
     log_ds(ds_dir, f"Running: {' '.join(cmd1)}")
     try:
         subprocess.run(cmd1, check=True)
@@ -100,7 +100,7 @@ def run_processing(ds_dir: Path, script_dir: Path, dzi_destination_dir: Optional
 
     # Step 2: DZI from stitched
     stitched_dir = ds_dir / "stitched"
-    cmd2 = [sys.executable, str(dzi_script), str(stitched_dir), "--split-channel"]
+    cmd2 = [sys.executable, str(dzi_script), str(stitched_dir), "--split-channel", "--no-skip-if-exists"]
     log_ds(ds_dir, f"Running: {' '.join(cmd2)}")
     try:
         subprocess.run(cmd2, check=True)

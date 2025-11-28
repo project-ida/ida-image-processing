@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
 Move DZI pairs (file.dzi + file_files/) from an origin tree into a destination,
-organized under a chosen subfolder name.
+organised under a chosen subfolder name.
 
 Subfolder naming priority:
 1) --folder-name-override
-2) --use-greatgrandparent-folder-name (uses great-grandparent directory name of the .dzi)
-3) --use-grandparent-folder-name      (uses grandparent directory name of the .dzi)
-4) .dzi filename stem
+2) --use-greatgreatgrandparent-folder-name 
+3) --use-greatgrandparent-folder-name  
+4) --use-grandparent-folder-name
+5) .dzi filename stem
 
 Examples
 --------
@@ -19,6 +20,9 @@ python move_dzi.py --dzi-origin ./in --dzi-destination ./out --use-grandparent-f
 
 # Use great-grandparent folder as the subfolder name
 python move_dzi.py --dzi-origin ./in --dzi-destination ./out --use-greatgrandparent-folder-name
+
+# Use great-great-grandparent folder as the subfolder name
+python move_dzi.py --dzi-origin ./in --dzi-destination ./out --use-greatgreatgrandparent-folder-name
 
 # Force a specific subfolder name
 python move_dzi.py --dzi-origin ./in --dzi-destination ./out --folder-name-override SampleA
@@ -33,6 +37,7 @@ from pathlib import Path
 import sys
 import os
 
+
 def find_files_folder(dzi_path: Path) -> Path | None:
     """
     Given /path/to/foo.dzi, look for a sibling directory named foo_files.
@@ -43,33 +48,43 @@ def find_files_folder(dzi_path: Path) -> Path | None:
     if candidate.is_dir():
         return candidate
 
-    # Fallback: search siblings under the same parent for exact match (handles odd cases)
+    # Fallback: search siblings under the same parent for exact match
     for p in dzi_path.parent.iterdir():
         if p.is_dir() and p.name == f"{stem}_files":
             return p
 
     return None
 
+
 def compute_subfolder_name(
     dzi_path: Path,
     use_grandparent: bool,
     use_greatgrandparent: bool,
+    use_greatgreatgrandparent: bool,
     override: str | None
 ) -> str:
     """
     Decide subfolder name with precedence:
-    override > great-grandparent > grandparent > stem
+    override > great-great-grandparent > great-grandparent > grandparent > stem
     """
     if override:
         return override
 
-    # parents[0] = parent, [1] = grandparent, [2] = great-grandparent
     parents = list(dzi_path.parents)
+    # parents[0] = parent, [1] = grandparent, [2] = great-grandparent, [3] = great-great-grandparent
+
+    if use_greatgreatgrandparent:
+        if len(parents) >= 4 and parents[3].name:
+            return parents[3].name
+        if len(parents) >= 3 and parents[2].name:
+            return parents[2].name
+        if len(parents) >= 2 and parents[1].name:
+            return parents[1].name
+        return dzi_path.stem
 
     if use_greatgrandparent:
         if len(parents) >= 3 and parents[2].name:
             return parents[2].name
-        # fall back if not deep enough
         if len(parents) >= 2 and parents[1].name:
             return parents[1].name
         return dzi_path.stem
@@ -80,6 +95,7 @@ def compute_subfolder_name(
         return dzi_path.stem
 
     return dzi_path.stem
+
 
 def safe_move(src: Path, dst: Path, overwrite: bool) -> None:
     """
@@ -94,15 +110,17 @@ def safe_move(src: Path, dst: Path, overwrite: bool) -> None:
             shutil.rmtree(dst)
         else:
             dst.unlink()
-    # Ensure parent exists
+
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(src), str(dst))
+
 
 def move_one_pair(
     dzi_path: Path,
     dest_root: Path,
     use_grandparent: bool,
     use_greatgrandparent: bool,
+    use_greatgreatgrandparent: bool,
     override: str | None,
     overwrite: bool,
 ) -> tuple[Path, Path, Path]:
@@ -116,20 +134,25 @@ def move_one_pair(
             f"(expected '{dzi_path.stem}_files' as a sibling)."
         )
 
-    subfolder = compute_subfolder_name(dzi_path, use_grandparent, use_greatgrandparent, override)
+    subfolder = compute_subfolder_name(
+        dzi_path,
+        use_grandparent,
+        use_greatgrandparent,
+        use_greatgreatgrandparent,
+        override
+    )
+
     target_dir = dest_root / subfolder
     target_dir.mkdir(parents=True, exist_ok=True)
 
-    # Compute targets
     dzi_target = target_dir / dzi_path.name
     files_target = target_dir / files_dir.name
 
-    # Move DZI first
-    safe_move(dzi_path, dzi_target, overwrite=overwrite)
-    # Then the folder
-    safe_move(files_dir, files_target, overwrite=overwrite)
+    safe_move(dzi_path, dzi_target, overwrite)
+    safe_move(files_dir, files_target, overwrite)
 
     return target_dir, dzi_target, files_target
+
 
 def main():
     parser = argparse.ArgumentParser(description="Move DZI pairs into a destination folder.")
@@ -137,16 +160,21 @@ def main():
                         help="Folder to search (recursively) for .dzi files.")
     parser.add_argument("--dzi-destination", required=True, type=Path,
                         help="Folder where DZI pairs will be moved.")
+
     parser.add_argument("--use-grandparent-folder-name", action="store_true",
                         help="Use the grandparent directory name of the .dzi as the subfolder name.")
     parser.add_argument("--use-greatgrandparent-folder-name", action="store_true",
                         help="Use the great-grandparent directory name of the .dzi as the subfolder name.")
+    parser.add_argument("--use-greatgreatgrandparent-folder-name", action="store_true",
+                        help="Use the great-great-grandparent directory name of the .dzi as the subfolder name.")
+
     parser.add_argument("--folder-name-override", default=None,
                         help="Explicit subfolder name to use (overrides other naming).")
     parser.add_argument("--overwrite", action="store_true",
                         help="Allow replacing existing files/directories at the destination if they exist.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Show what would be moved without making changes.")
+
     args = parser.parse_args()
 
     origin: Path = args.dzi_origin
@@ -169,36 +197,40 @@ def main():
 
     for dzi in dzi_list:
         try:
-            # Preview
             files_dir = find_files_folder(dzi)
             if files_dir is None:
                 raise FileNotFoundError(
                     f"Missing _files folder for: {dzi} (expected '{dzi.stem}_files')"
                 )
+
             subfolder = compute_subfolder_name(
                 dzi,
                 args.use_grandparent_folder_name,
                 args.use_greatgrandparent_folder_name,
+                args.use_greatgreatgrandparent_folder_name,
                 args.folder_name_override
             )
+
             target_dir = destination / subfolder
             dzi_target = target_dir / dzi.name
             files_target = target_dir / files_dir.name
 
             if args.dry_run:
                 print(f"[DRY-RUN] Would move:")
-                print(f"  DZI:    {dzi}  -> {dzi_target}")
+                print(f"  DZI:    {dzi} -> {dzi_target}")
                 print(f"  FOLDER: {files_dir} -> {files_target}")
                 continue
 
-            target_dir, new_dzi, new_files = move_one_pair(
+            move_one_pair(
                 dzi,
                 destination,
                 args.use_grandparent_folder_name,
                 args.use_greatgrandparent_folder_name,
+                args.use_greatgreatgrandparent_folder_name,
                 args.folder_name_override,
                 args.overwrite
             )
+
             print(f"Moved: {dzi.name} and '{files_dir.name}' -> {target_dir}")
             moved_count += 1
 

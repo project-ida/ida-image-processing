@@ -126,11 +126,17 @@ def main():
     p = argparse.ArgumentParser(
         description="Create a metric overlay grid (+labels) JSON for the SEM viewer."
     )
-    dim = p.add_mutually_exclusive_group(required=True)
-    dim.add_argument("--data-folder", type=str,
-                     help="Folder containing summary_table.csv (with the standard header).")
-    dim.add_argument("--width-mm", type=float,
-                     help="Total width of stitched area in mm (use with --height-mm).")
+
+    # Positional argument: data folder containing summary_table.csv
+    p.add_argument(
+        "data_folder",
+        type=str,
+        help="Folder containing summary_table.csv and where overlays will be written."
+    )
+
+    # Optional manual dimension override
+    p.add_argument("--width-mm", type=float,
+                   help="Total width of stitched area in mm (use with --height-mm).")
     p.add_argument("--height-mm", type=float,
                    help="Total height of stitched area in mm (use with --width-mm).")
 
@@ -139,25 +145,26 @@ def main():
     p.add_argument("--font-mm", type=float, default=0.15,
                    help="Label height in mm (default: 0.15).")
 
-    p.add_argument("--out-dir", type=str, default=".",
-                   help="Output directory (default: current dir).")
     p.add_argument("--single-file", type=str, default=None,
-                   help="Optional explicit path for a single overlay JSON. "
-                        "If not set, defaults to <out-dir>/metric_overlay.json.")
+                   help="Explicit output path for a single overlay JSON "
+                        "(otherwise defaults to <data-folder>/overlays/metric_overlay.json).")
+
     p.add_argument("--separate", action="store_true",
                    help="Write two files: metric_grid.json and metric_labels.json. "
                         "By default a single file is written.")
 
     args = p.parse_args()
 
-    # Resolve dimensions
-    if args.data_folder:
-        w_mm, h_mm = dims_from_summary(Path(args.data_folder))
-    else:
-        if args.width_mm is None or args.height_mm is None:
-            raise SystemExit("--width-mm and --height-mm must both be provided when not using --data-folder.")
-        w_mm, h_mm = float(args.width_mm), float(args.height_mm)
+    data_folder = Path(args.data_folder)
 
+    # Resolve dimensions: overrides take precedence
+    if args.width_mm is not None and args.height_mm is not None:
+        w_mm = float(args.width_mm)
+        h_mm = float(args.height_mm)
+    else:
+        w_mm, h_mm = dims_from_summary(data_folder)
+
+    # Build grid + labels
     grid_items, label_items = build_metric_grid(
         width_mm=w_mm,
         height_mm=h_mm,
@@ -165,18 +172,9 @@ def main():
         font_mm=args.font_mm,
     )
 
-    # Determine the base folder to anchor overlays
-    if args.data_folder:
-        # Always store overlays inside the data folder
-        base_folder = Path(args.data_folder)
-    else:
-        # Fall back to user-provided out-dir
-        base_folder = Path(args.out_dir)
-
-    # overlays subfolder
-    out_dir = base_folder / "overlays"
+    # All outputs go to <data_folder>/overlays/
+    out_dir = data_folder / "overlays"
     out_dir.mkdir(parents=True, exist_ok=True)
-
 
     # Attach gating metadata so the viewer shows these only after origin is set
     meta = {
@@ -199,6 +197,6 @@ def main():
         out_path.write_text(json.dumps({**meta, "items": merged}, indent=2))
         print(f"wrote {out_path} (single overlay)")
 
+
 if __name__ == "__main__":
     main()
-

@@ -5,7 +5,7 @@ def main():
     ap = argparse.ArgumentParser(
         description="Create stitching-grid.json from summary_table.csv"
     )
-    ap.add_argument("input_csv", help="CSV with X_rel_um, Y_rel_um, TileWidth_um, TileHeight_um")
+    ap.add_argument("input_csv", help="summary_table.csv CSV file with X_rel_um, Y_rel_um, TileWidth_um, TileHeight_um")
     ap.add_argument("output_json", nargs="?", help="Output path (default: stitching-grid.json next to input)")
     args = ap.parse_args()
 

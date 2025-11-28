@@ -5,17 +5,28 @@ def main():
     ap = argparse.ArgumentParser(
         description="Create stitching-grid.json from summary_table.csv"
     )
-    ap.add_argument("input_csv", help="summary_table.csv CSV file with X_rel_um, Y_rel_um, TileWidth_um, TileHeight_um")
-    ap.add_argument("output_json", nargs="?", help="Output path (default: stitching-grid.json next to input)")
+    ap.add_argument("input_folder", help="Folder containing summary_table.csv")
+    ap.add_argument("output_json", nargs="?", help="Output filename (stored in overlays/ inside the folder)")
     args = ap.parse_args()
 
-    out_path = args.output_json or os.path.join(
-        os.path.dirname(os.path.abspath(args.input_csv)),
-        "stitching-grid.json"
-    )
+    # input_folder contains a CSV whose name is always summary_table.csv    
+    folder = os.path.abspath(args.input_folder)
+    csv_path = os.path.join(folder, "summary_table.csv")
+
+    if not os.path.exists(csv_path):
+        raise SystemExit(f"summary_table.csv not found in {folder}")
+
+    # output is always under overlays/ inside the folder
+    overlays_dir = os.path.join(folder, "overlays")
+    os.makedirs(overlays_dir, exist_ok=True)
+
+    if args.output_json:
+        out_path = os.path.join(overlays_dir, args.output_json)
+    else:
+        out_path = os.path.join(overlays_dir, "stitching-grid.json")
 
     items = []
-    with open(args.input_csv, newline="", encoding="utf-8") as f:
+    with open(csv_path, newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
             items.append({
                 "type": "rect",
@@ -43,4 +54,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

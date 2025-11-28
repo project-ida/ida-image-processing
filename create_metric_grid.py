@@ -165,8 +165,18 @@ def main():
         font_mm=args.font_mm,
     )
 
-    out_dir = Path(args.out_dir)
+    # Determine the base folder to anchor overlays
+    if args.data_folder:
+        # Always store overlays inside the data folder
+        base_folder = Path(args.data_folder)
+    else:
+        # Fall back to user-provided out-dir
+        base_folder = Path(args.out_dir)
+
+    # overlays subfolder
+    out_dir = base_folder / "overlays"
     out_dir.mkdir(parents=True, exist_ok=True)
+
 
     # Attach gating metadata so the viewer shows these only after origin is set
     meta = {

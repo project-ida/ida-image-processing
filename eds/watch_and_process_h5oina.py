@@ -24,7 +24,6 @@ WRITE_MASTER_LOG = True                       # also keep one global log in BASE
 # filled from CLI:
 BASE_DIR: Path
 SCALE: str
-CHANNEL: str
 MASTER_LOG_PATH: Path
 DZI_DEST: Optional[Path]
 DRY_RUN: bool = False   # global dry-run flag
@@ -121,15 +120,15 @@ def run_processing(
 
     - Respects dry_run: logs "Would run:" and does not execute subprocesses.
     - Includes:
-        * rotation via rotation.txt (passed to stitch_ndtiff.py as --rotate)
-        * --overwrite to stitch_ndtiff.py
-        * --split-channel and --no-skip-if-exists to dzi_from_bigtiff.py
+        * rotation via rotation.txt (passed to stitch_h5data.py as --rotate)
+        * --overwrite to stitch_h5data.py
+        * --no-skip-if-exists to dzi_from_bigtiff.py
         * --use-greatgrandparent-folder-name and --overwrite to move_dzi.py
     """
     # Layout:
-    #   watcher + stitch_ndtiff.py live in the same folder (script_dir)
+    #   watcher + stitch_h5data.py live in the same folder (script_dir)
     #   dzi_from_bigtiff.py and move_dzi.py live in the parent folder
-    stitch_script = script_dir / "stitch_ndtiff.py"
+    stitch_script = script_dir / "stitch_h5data.py"
     dzi_script    = script_dir.parent / "dzi_from_bigtiff.py"
     moving_script = script_dir.parent / "move_dzi.py"
 
@@ -140,7 +139,6 @@ def run_processing(
     cmd1 = [
         sys.executable, str(stitch_script), str(ds_dir),
         "--scale", SCALE,
-        "--channel", CHANNEL,
         *rotate_args,
         "--overwrite",  # allow stitched BigTIFF overwrite
     ]
@@ -150,17 +148,16 @@ def run_processing(
         try:
             subprocess.run(cmd1, check=True)
         except subprocess.CalledProcessError as e:
-            log_ds(ds_dir, f"ERROR: stitch_ndtiff failed with code {e.returncode}", dry_run=dry_run)
+            log_ds(ds_dir, f"ERROR: stitch_h5data failed with code {e.returncode}", dry_run=dry_run)
             return False
     else:
-        log_ds(ds_dir, "DRY-RUN: Skipping execution of stitch_ndtiff.py", dry_run=dry_run)
+        log_ds(ds_dir, "DRY-RUN: Skipping execution of stitch_h5data.py", dry_run=dry_run)
 
     # Step 2: DZI from stitched
     stitched_dir = ds_dir / "stitched"
     cmd2 = [
         sys.executable, str(dzi_script),
         str(stitched_dir),
-        "--split-channel",
         "--no-skip-if-exists",   # force regeneration of DZIs
     ]
     log_msg = f"Would run: {' '.join(cmd2)}" if dry_run else f"Running: {' '.join(cmd2)}"
@@ -180,7 +177,7 @@ def run_processing(
             sys.executable, str(moving_script),
             "--dzi-origin", str(stitched_dir),
             "--dzi-destination", str(dzi_destination_dir),
-            "--use-greatgrandparent-folder-name",
+            "--use-greatgreatgrandparent-folder-name",
             "--overwrite",  # allow replacing existing DZI targets
         ]
         log_msg = f"Would run: {' '.join(cmd3)}" if dry_run else f"Running: {' '.join(cmd3)}"
@@ -207,11 +204,7 @@ def parse_args():
     )
     ap.add_argument(
         "--scale", default="1.0",
-        help="Scale passed to stitch_ndtiff.py (default: 1.0)"
-    )
-    ap.add_argument(
-        "--channel", default="g",
-        help="Channel passed to stitch_ndtiff.py (default: g)"
+        help="Scale passed to stitch_h5data.py (default: 1.0)"
     )
     ap.add_argument(
         "--dzi-destination", required=False,
@@ -225,12 +218,11 @@ def parse_args():
 
 
 def main():
-    global BASE_DIR, SCALE, CHANNEL, DZI_DEST, MASTER_LOG_PATH, DRY_RUN
+    global BASE_DIR, SCALE, DZI_DEST, MASTER_LOG_PATH, DRY_RUN
 
     args = parse_args()
     BASE_DIR = Path(args.base_dir)
     SCALE = args.scale
-    CHANNEL = args.channel
     DZI_DEST = Path(args.dzi_destination) if args.dzi_destination else None
     DRY_RUN = args.dry_run
 
@@ -244,7 +236,7 @@ def main():
     mode = " (DRY-RUN)" if DRY_RUN else ""
     log_master(
         f"Watching (recursive) {BASE_DIR} (scripts in {script_dir}) | "
-        f"scale={SCALE} channel={CHANNEL} dzi-destination={DZI_DEST}{mode}"
+        f"scale={SCALE} dzi-destination={DZI_DEST}{mode}"
     )
 
     while True:

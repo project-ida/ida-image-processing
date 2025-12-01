@@ -115,6 +115,23 @@ def safe_move(src: Path, dst: Path, overwrite: bool) -> None:
     shutil.move(str(src), str(dst))
 
 
+def safe_copy_file(src: Path, dst: Path, overwrite: bool) -> None:
+    """
+    Copy a single file src -> dst.
+    If dst exists:
+      - overwrite=False: raise FileExistsError
+      - overwrite=True: overwrite the file
+    """
+    if dst.exists():
+        if not overwrite:
+            raise FileExistsError(f"Destination already exists: {dst}")
+        if dst.is_dir():
+            raise IsADirectoryError(f"Destination is a directory, expected file: {dst}")
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(str(src), str(dst))
+
+
 def move_one_pair(
     dzi_path: Path,
     dest_root: Path,
@@ -186,6 +203,13 @@ def main():
 
     destination.mkdir(parents=True, exist_ok=True)
 
+    # New: we may also move "overlays" and "aggregated-spectra" from the parent of the origin
+    origin_parent = origin.parent
+    overlays_moved = False
+    aggspec_moved = False
+    config_moved = False
+    rotation_moved = False
+
     dzi_list = sorted(origin.rglob("*.dzi"))
     if not dzi_list:
         print(f"No .dzi files found under: {origin}")
@@ -219,9 +243,42 @@ def main():
                 print(f"[DRY-RUN] Would move:")
                 print(f"  DZI:    {dzi} -> {dzi_target}")
                 print(f"  FOLDER: {files_dir} -> {files_target}")
+
+                # New: overlays (parent of origin)
+                if not overlays_moved:
+                    overlays_src = origin_parent / "overlays"
+                    if overlays_src.is_dir():
+                        overlays_dst = target_dir / "overlays"
+                        print(f"[DRY-RUN] Would move overlays: {overlays_src} -> {overlays_dst}")
+                        overlays_moved = True 
+
+                # New: aggregated-spectra (parent of origin)
+                if not aggspec_moved:
+                    aggspec_src = origin_parent / "aggregated-spectra"
+                    if aggspec_src.is_dir():
+                        aggspec_dst = target_dir / "aggregated-spectra"
+                        print(f"[DRY-RUN] Would move aggregated-spectra: {aggspec_src} -> {aggspec_dst}")
+                        aggspec_moved = True
+
+                # New: config.txt (parent of origin) – copy in real run
+                if not config_moved:
+                    config_src = origin_parent / "config.txt"
+                    if config_src.is_file():
+                        config_dst = target_dir / "config.txt"
+                        print(f"[DRY-RUN] Would copy config.txt: {config_src} -> {config_dst}")
+                        config_moved = True
+
+                # New: rotation.txt (parent of origin) – copy in real run
+                if not rotation_moved:
+                    rotation_src = origin_parent / "rotation.txt"
+                    if rotation_src.is_file():
+                        rotation_dst = target_dir / "rotation.txt"
+                        print(f"[DRY-RUN] Would copy rotation.txt: {rotation_src} -> {rotation_dst}")
+                        rotation_moved = True
+
                 continue
 
-            move_one_pair(
+            target_dir, moved_dzi_path, moved_files_dir = move_one_pair(
                 dzi,
                 destination,
                 args.use_grandparent_folder_name,
@@ -233,6 +290,62 @@ def main():
 
             print(f"Moved: {dzi.name} and '{files_dir.name}' -> {target_dir}")
             moved_count += 1
+
+            # New: move overlays directory once, if present
+            if not overlays_moved:
+                overlays_src = origin_parent / "overlays"
+                if overlays_src.is_dir():
+                    overlays_dst = target_dir / "overlays"
+                    try:
+                        safe_move(overlays_src, overlays_dst, args.overwrite)
+                        print(f"Moved overlays: {overlays_src} -> {overlays_dst}")
+                    except Exception as e:
+                        msg = f"ERROR moving overlays {overlays_src} -> {overlays_dst}: {e}"
+                        print(msg, file=sys.stderr)
+                        errors.append(msg)
+                    overlays_moved = True
+
+            # New: move aggregated-spectra directory once, if present
+            if not aggspec_moved:
+                aggspec_src = origin_parent / "aggregated-spectra"
+                if aggspec_src.is_dir():
+                    aggspec_dst = target_dir / "aggregated-spectra"
+                    try:
+                        safe_move(aggspec_src, aggspec_dst, args.overwrite)
+                        print(f"Moved aggregated-spectra: {aggspec_src} -> {aggspec_dst}")
+                    except Exception as e:
+                        msg = f"ERROR moving aggregated-spectra {aggspec_src} -> {aggspec_dst}: {e}"
+                        print(msg, file=sys.stderr)
+                        errors.append(msg)
+                    aggspec_moved = True
+
+            # Copy config.txt once, if present
+            if not config_moved:
+                config_src = origin_parent / "config.txt"
+                if config_src.is_file():
+                    config_dst = target_dir / "config.txt"
+                    try:
+                        safe_copy_file(config_src, config_dst, args.overwrite)
+                        print(f"Copied config.txt: {config_src} -> {config_dst}")
+                    except Exception as e:
+                        msg = f"ERROR copying config.txt {config_src} -> {config_dst}: {e}"
+                        print(msg, file=sys.stderr)
+                        errors.append(msg)
+                    config_moved = True
+
+            # Copy rotation.txt once, if present
+            if not rotation_moved:
+                rotation_src = origin_parent / "rotation.txt"
+                if rotation_src.is_file():
+                    rotation_dst = target_dir / "rotation.txt"
+                    try:
+                        safe_copy_file(rotation_src, rotation_dst, args.overwrite)
+                        print(f"Copied rotation.txt: {rotation_src} -> {rotation_dst}")
+                    except Exception as e:
+                        msg = f"ERROR copying rotation.txt {rotation_src} -> {rotation_dst}: {e}"
+                        print(msg, file=sys.stderr)
+                        errors.append(msg)
+                    rotation_moved = True
 
         except Exception as e:
             msg = f"ERROR processing {dzi}: {e}"

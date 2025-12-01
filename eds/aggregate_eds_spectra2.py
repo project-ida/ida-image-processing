@@ -70,8 +70,11 @@ def main():
                 "TileHeight_um": float(row["TileHeight_um"]),
             }
 
-    out_dir = root / f"aggregated-spectra"
+    out_dir = root / "aggregated-spectra"
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Precompute which JSONs already exist: basename -> json present
+    existing_json_basenames = {p.stem for p in out_dir.glob("*.json")}
 
     npz_files = sorted(root.rglob("*_eds.npz"))
     if not npz_files:
@@ -80,8 +83,14 @@ def main():
     total = len(npz_files)
     processed = skipped = 0
     for i, npz in enumerate(npz_files, 1):
-        print(f"[{i}/{total}] {npz.name} …", flush=True)
         basename = npz.name[:-8]  # strip "_eds.npz"
+        print(f"[{i}/{total}] {npz.name} …", flush=True)
+
+        # Fast skip if we already have the JSON for this basename
+        if basename in existing_json_basenames:
+            print(f"  -> skip: {basename}.json already exists (pre-indexed)")
+            skipped += 1
+            continue
 
         meta = summary.get(basename)
         if meta is None:
@@ -135,6 +144,12 @@ def main():
                 })
 
         out_json = out_dir / f"{basename}.json"
+        # (Secondary guard in case new JSONs appeared during this run or names collide)
+        if out_json.exists():
+            print(f"  -> skip: {out_json.name} already exists")
+            skipped += 1
+            continue
+
         with open(out_json, "w", encoding="utf-8") as f:
             json.dump(entries, f, separators=(",", ":"))
         processed += 1
@@ -144,4 +159,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

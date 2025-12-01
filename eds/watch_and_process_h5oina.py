@@ -136,7 +136,7 @@ def run_processing(
     parent_dir              = script_dir.parent
     dzi_script              = parent_dir / "dzi_from_bigtiff.py"
     metric_grid_script      = parent_dir / "create_metric_grid.py"
-    stitching_grid_script   = parent_dir / "create-stitching-grid.py"
+    stitching_grid_script   = parent_dir / "create_stitching_grid.py"
     moving_script           = parent_dir / "move_dzi.py"
 
     # Optional rotation argument from rotation.txt (per dataset)

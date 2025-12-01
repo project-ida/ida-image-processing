@@ -42,7 +42,7 @@ def main():
     )
     ap.add_argument(
         "-o", "--output",
-        help="Output JSON (default: selection_grid.json in input_folder)"
+        help="Output JSON (default: selection-grid.json in input_folder)"
     )
     ap.add_argument(
         "--stroke", default="#000000",
@@ -75,11 +75,11 @@ def main():
         out_path = args.output
     else:
         # Default behaviour:
-        #   ../overlays/selection_grid.json
+        #   ../overlays/selection-grid.json
         parent = os.path.dirname(in_dir)
         overlay_dir = os.path.join(parent, "overlays")
         os.makedirs(overlay_dir, exist_ok=True)
-        out_path = os.path.join(overlay_dir, "selection_grid.json")
+        out_path = os.path.join(overlay_dir, "selection-grid.json")
 
     files = sorted(glob(os.path.join(in_dir, "*.json")))
     if not files:

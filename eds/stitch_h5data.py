@@ -141,6 +141,8 @@ def parse_args():
     p.add_argument("--um-per-px", type=float, default=None,
                    help="Global µm per pixel (if omitted, read from CSV first row and require X==Y).")
     p.add_argument("--scale", type=float, default=1.0, help="Extra scale factor (default 1.0)")
+    p.add_argument("--rotate", type=float, default=0.0,
+                   help="Optional rotation in degrees (CCW) applied to stage coordinates before stitching.")
     p.add_argument("--tile", type=int, default=128, help="TIFF tile size (default 128)")
     p.add_argument("--workers", type=int, default=2, help="libvips worker threads")
     p.add_argument("--overwrite", action=argparse.BooleanOptionalAction, default=True,
@@ -217,6 +219,14 @@ def main():
 
     Xum = np.asarray(Xum, dtype=np.float64)
     Yum = np.asarray(Yum, dtype=np.float64)
+    # ---- optional rotation of stage coordinates (degrees, CCW) ----
+    if abs(getattr(args, "rotate", 0.0)) > 1e-9:
+        theta = math.radians(args.rotate)
+        c, s = math.cos(theta), math.sin(theta)
+        Xr = Xum * c - Yum * s
+        Yr = Xum * s + Yum * c
+        Xum, Yum = Xr, Yr
+        print(f"Applying rotation: {args.rotate:.6f} deg")
     Wpx = np.asarray(Wpx, dtype=np.int32)
     Hpx = np.asarray(Hpx, dtype=np.int32)
 

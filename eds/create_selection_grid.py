@@ -69,10 +69,10 @@ def main():
     args = ap.parse_args()
 
     in_dir = os.path.abspath(args.input_folder)
-    
+
     if args.output:
-    # User explicitly set an output path
-    out_path = args.output
+        # User explicitly set an output path
+        out_path = args.output
     else:
         # Default behaviour:
         #   ../overlays/selection_grid.json
@@ -162,4 +162,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

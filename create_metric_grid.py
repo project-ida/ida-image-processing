@@ -147,7 +147,7 @@ def main():
 
     p.add_argument("--single-file", type=str, default=None,
                    help="Explicit output path for a single overlay JSON "
-                        "(otherwise defaults to <data-folder>/overlays/metric_overlay.json).")
+                        "(otherwise defaults to <data-folder>/overlays/metric-overlay.json).")
 
     p.add_argument("--separate", action="store_true",
                    help="Write two files: metric_grid.json and metric_labels.json. "
@@ -192,7 +192,7 @@ def main():
         print(f"wrote {labels_path}")
     else:
         # Default: single overlay file combining rects + text in one flat "items" list
-        out_path = Path(args.single_file) if args.single_file else (out_dir / "metric_overlay.json")
+        out_path = Path(args.single_file) if args.single_file else (out_dir / "metric-overlay.json")
         merged = [*grid_items, *label_items]
         out_path.write_text(json.dumps({**meta, "items": merged}, indent=2))
         print(f"wrote {out_path} (single overlay)")

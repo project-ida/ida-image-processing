@@ -192,7 +192,7 @@ def main():
         print(f"wrote {labels_path}")
     else:
         # Default: single overlay file combining rects + text in one flat "items" list
-        out_path = Path(args.single_file) if args.single_file else (out_dir / "metric-overlay.json")
+        out_path = Path(args.single_file) if args.single_file else (out_dir / "metric-grid.json")
         merged = [*grid_items, *label_items]
         out_path.write_text(json.dumps({**meta, "items": merged}, indent=2))
         print(f"wrote {out_path} (single overlay)")

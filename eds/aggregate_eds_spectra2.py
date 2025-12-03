@@ -1,17 +1,31 @@
 #!/usr/bin/env python3
 import argparse, pathlib, csv, json, numpy as np
 
-def load_cube(p: pathlib.Path) -> np.ndarray:
+def _detect_channel_axis_3d(shape):
+    """
+    Decide which axis of a 3D EDS cube is the channel axis.
+
+    Rules based on known EDS exports:
+      - Channel length is typically 1024 or 2048.
+      - If multiple axes match {1024, 2048}, prefer the LAST one.
+      - If no axis matches, fall back to the largest dimension.
+    """
+    candidates = [i for i, d in enumerate(shape) if d in (1024, 2048)]
+    if len(candidates) == 1:
+        return candidates[0]
+    elif len(candidates) > 1:
+        return max(candidates)
+    else:
+        return int(np.argmax(shape))
+
+def load_eds_cube(p: pathlib.Path) -> np.ndarray:
     """
     Load an EDS counts cube from an NPZ file and return it as (H, W, C)
     with channels last.
 
-    This is flexible enough to handle both:
-      - legacy format: (C, H, W)  (channels first)
-      - new format:    (H, W, C)  (channels last)
-
-    We assume the channel axis is the *largest* dimension, which holds for
-    typical EDS data (e.g. 2048 energy channels vs. smaller x/y sizes).
+    Flexible enough to handle:
+      - legacy format: (C, H, W) or permutations with C in {1024, 2048}
+      - modern format: (H, W, C)
     """
     with np.load(p, allow_pickle=False) as z:
         # Prefer a key named 'eds_data' if present; otherwise take the first.
@@ -21,14 +35,13 @@ def load_cube(p: pathlib.Path) -> np.ndarray:
     if a.ndim != 3:
         raise ValueError(f"{p.name}: expected 3D counts cube, got {a.shape}")
 
-    # Identify channel axis as the largest dimension
-    c_axis = int(np.argmax(a.shape))
+    c_axis = _detect_channel_axis_3d(a.shape)
 
     # Move channel axis to the last position if needed
     if c_axis != 2:
         a = np.moveaxis(a, c_axis, -1)
 
-    # Now a has shape (H, W, C)
+    # Now a has shape (H, W, C) with spectral axis last
     return a
 
 def window_sums_cropped(cube: np.ndarray, rows: int, cols: int,
@@ -119,7 +132,7 @@ def main():
             continue
 
         try:
-            cube = load_cube(npz)
+            cube = load_eds_cube(npz)
         except Exception as e:
             print(f"  -> skip: {e}")
             skipped += 1

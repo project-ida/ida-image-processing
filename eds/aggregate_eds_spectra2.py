@@ -2,13 +2,33 @@
 import argparse, pathlib, csv, json, numpy as np
 
 def load_cube(p: pathlib.Path) -> np.ndarray:
+    """
+    Load an EDS counts cube from an NPZ file and return it as (H, W, C)
+    with channels last.
+
+    This is flexible enough to handle both:
+      - legacy format: (C, H, W)  (channels first)
+      - new format:    (H, W, C)  (channels last)
+
+    We assume the channel axis is the *largest* dimension, which holds for
+    typical EDS data (e.g. 2048 energy channels vs. smaller x/y sizes).
+    """
     with np.load(p, allow_pickle=False) as z:
-        a = np.asarray(z[next(iter(z.files))])
+        # Prefer a key named 'eds_data' if present; otherwise take the first.
+        key = "eds_data" if "eds_data" in z.files else next(iter(z.files))
+        a = np.asarray(z[key])
+
     if a.ndim != 3:
         raise ValueError(f"{p.name}: expected 3D counts cube, got {a.shape}")
-    # ensure channels-last (H, W, C) if needed
-    if a.shape[0] < min(a.shape[1], a.shape[2]):  # likely (C,H,W)
-        a = np.moveaxis(a, 0, -1)
+
+    # Identify channel axis as the largest dimension
+    c_axis = int(np.argmax(a.shape))
+
+    # Move channel axis to the last position if needed
+    if c_axis != 2:
+        a = np.moveaxis(a, c_axis, -1)
+
+    # Now a has shape (H, W, C)
     return a
 
 def window_sums_cropped(cube: np.ndarray, rows: int, cols: int,

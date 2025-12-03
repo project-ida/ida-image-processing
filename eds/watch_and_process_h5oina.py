@@ -13,6 +13,7 @@ from typing import Iterable, Optional
 POLL_SECONDS   = 60                      # check once per minute
 GRACE_AFTER_FINISH_SECONDS = 5           # wait after detection before processing
 INDEX_NAME     = "summary_table.csv"     # identifies an h5 dataset root
+TRIGGER_NAME   = "read_to_process.txt"   # when this file is present, the processing starts
 
 # Logs:
 LOG_NAME       = "auto_process.log"           # Real run
@@ -66,7 +67,7 @@ def log_ds(ds_dir: Path, msg: str, dry_run: bool = False) -> None:
 
 def list_candidate_datasets_recursive(base: Path, dry_run: bool = False) -> Iterable[Path]:
     """
-    Yield dataset roots that contain INDEX_NAME (summary_table.csv).
+    Yield dataset roots that contain TRIGGER_NAME (ready_to_process.txt).
 
     - Normal mode: skip if auto_process.log exists
     - Dry-run mode: skip if EITHER auto_process.log OR auto_process.dryrun.log exists
@@ -75,7 +76,7 @@ def list_candidate_datasets_recursive(base: Path, dry_run: bool = False) -> Iter
         return
 
     for root, dirs, files in os.walk(base):
-        if INDEX_NAME not in files:
+        if TRIGGER_NAME not in files:
             continue
 
         # Real run: only check real log

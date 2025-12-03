@@ -14,7 +14,7 @@ from ndstorage import Dataset
 POLL_SECONDS   = 60                      # check once per minute
 GRACE_AFTER_FINISH_SECONDS = 5           # wait after is_finished() before processing
 INDEX_NAME     = "NDTiff.index"          # identifies a dataset root
-TRIGGER_NAME   = "read_to_process.txt"   # when this file is present, the processing starts
+TRIGGER_NAME   = "ready_to_process.txt"   # when this file is present, the processing starts
 
 # Logs:
 LOG_NAME       = "auto_process.log"           # Real run

@@ -13,7 +13,7 @@ from typing import Iterable, Optional
 POLL_SECONDS   = 60                      # check once per minute
 GRACE_AFTER_FINISH_SECONDS = 5           # wait after detection before processing
 INDEX_NAME     = "summary_table.csv"     # identifies an h5 dataset root
-TRIGGER_NAME   = "read_to_process.txt"   # when this file is present, the processing starts
+TRIGGER_NAME   = "ready_to_process.txt"   # when this file is present, the processing starts
 
 # Logs:
 LOG_NAME       = "auto_process.log"           # Real run

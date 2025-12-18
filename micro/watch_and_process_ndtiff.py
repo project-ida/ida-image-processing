@@ -67,7 +67,7 @@ def log_ds(ds_dir: Path, msg: str, dry_run: bool = False) -> None:
 
 def list_candidate_datasets_recursive(base: Path, dry_run: bool = False) -> Iterable[Path]:
     """
-    Yield dataset roots with NDTiff.index.
+    Yield dataset roots that contain TRIGGER_NAME (ready_to_process.txt).
 
     - Normal mode: skip if auto_process.log exists
     - Dry-run mode: skip if EITHER auto_process.log OR auto_process.dryrun.log exists

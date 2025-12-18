@@ -5,6 +5,7 @@ import sys
 import time
 import argparse
 import subprocess
+import re
 from pathlib import Path
 from datetime import datetime
 from typing import Iterable, Optional
@@ -71,6 +72,8 @@ def list_candidate_datasets_recursive(base: Path, dry_run: bool = False) -> Iter
 
     - Normal mode: skip if auto_process.log exists
     - Dry-run mode: skip if EITHER auto_process.log OR auto_process.dryrun.log exists
+    - If TRIGGER_NAME contains a line like "number_of_files=<N>", only yield once at least
+      N (non-hidden) files exist in that same directory (excluding trigger/log files).
     """
     if not base.exists():
         return
@@ -79,14 +82,53 @@ def list_candidate_datasets_recursive(base: Path, dry_run: bool = False) -> Iter
         if TRIGGER_NAME not in files:
             continue
 
+        # Log rules (skip already-processed datasets)
         # Real run: only check real log
         if not dry_run:
-            if LOG_NAME not in files:
-                yield Path(root)
+            if LOG_NAME in files:
+                continue
         # Dry-run: skip if ANY log exists
         else:
-            if LOG_NAME not in files and LOG_NAME_DRY not in files:
-                yield Path(root)
+            if LOG_NAME in files or LOG_NAME_DRY in files:
+                continue
+
+        ds_dir = Path(root)
+        trigger_path = ds_dir / TRIGGER_NAME
+
+        # If trigger file is empty: existence triggers immediately.
+        # If it contains "number_of_files=<N>": wait until at least N files exist.
+        try:
+            trigger_text = trigger_path.read_text(encoding="utf-8")
+        except Exception:
+            # If we can't read it (e.g., syncing/incomplete), retry next poll.
+            continue
+
+        if trigger_text.strip() != "":
+            expected: Optional[int] = None
+            for line in trigger_text.splitlines():
+                if not re.match(r"^\s*number_of_files\s*=", line, re.IGNORECASE):
+                    continue
+                value = line.split("=", 1)[1].split("#", 1)[0].strip()
+                if value == "":
+                    # Key present but value missing; treat as "not ready yet".
+                    expected = -1
+                    break
+                try:
+                    expected = int(value)
+                except ValueError:
+                    expected = -1
+                break
+
+            if expected is not None:
+                if expected < 0:
+                    continue
+                if expected > 0:
+                    ignore = {TRIGGER_NAME, LOG_NAME, LOG_NAME_DRY}
+                    present = sum(1 for f in files if f not in ignore and not f.startswith("."))
+                    if present < expected:
+                        continue
+
+        yield ds_dir
 
 
 def read_rotation_arg(ds_dir: Path, dry_run: bool = False) -> list[str]:

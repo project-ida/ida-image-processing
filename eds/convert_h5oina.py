@@ -36,6 +36,15 @@ def process_h5oina_file(filepath, output_folder):
         x_pixels = file['/1/EDS/Header/X Cells'][0]
         y_pixels = file['/1/EDS/Header/Y Cells'][0]
         spectrum_length = file['/1/EDS/Header/Number Channels'][0]
+        # --- EDS energy calibration from header ---
+        channel_width_eV = float(file['/1/EDS/Header/Channel Width'][0])
+        start_eV         = float(file['/1/EDS/Header/Start Channel'][0])
+        energy_range_eV  = float(file['/1/EDS/Header/Energy Range'][0])
+        n_channels       = int(spectrum_length)
+
+        # Derived quantities (nice to have, optional)
+        e_min_eV = start_eV
+        e_max_eV = start_eV + channel_width_eV * (n_channels - 1)
 
         spectra_array2 = np.zeros((y_pixels, x_pixels, spectrum_length), dtype=np.uint8)
         chunk_size = 10000
@@ -60,13 +69,20 @@ def process_h5oina_file(filepath, output_folder):
             '/1/EDS/Header/Y Cells': y_pixels,
             '/1/EDS/Header/X Step': file['/1/EDS/Header/X Step'][0],
             '/1/EDS/Header/Y Step': file['/1/EDS/Header/Y Step'][0],
-            '/1/EDS/Header/Start Channel': file['/1/EDS/Header/Start Channel'][0],
-            '/1/EDS/Header/Channel Width': file['/1/EDS/Header/Channel Width'][0],
-            '/1/EDS/Header/Energy Range': file['/1/EDS/Header/Energy Range'][0],
-            '/1/EDS/Header/Number Channels': spectrum_length,
+            '/1/EDS/Header/Start Channel': start_eV,
+            '/1/EDS/Header/Channel Width': channel_width_eV,
+            '/1/EDS/Header/Energy Range': energy_range_eV,
+            '/1/EDS/Header/Number Channels': n_channels,
             '/1/EDS/Header/Stage Position/X': file['/1/EDS/Header/Stage Position/X'][0],
             '/1/EDS/Header/Stage Position/Y': file['/1/EDS/Header/Stage Position/Y'][0],
             '/1/EDS/Header/Stage Position/Z': file['/1/EDS/Header/Stage Position/Z'][0],
+
+            # --- NEW: viewer-friendly keys for config.txt ---
+            'eds_ev_per_ch': channel_width_eV,
+            'eds_start_ev':  start_eV,
+            'eds_n_channels': n_channels,
+            'eds_e_min_ev':  e_min_eV,
+            'eds_e_max_ev':  e_max_eV,
         }
         metadata_path = os.path.join(output_folder, f"{filename}_metadata.txt")
         with open(metadata_path, 'w') as meta_file:

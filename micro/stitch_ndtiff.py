@@ -110,6 +110,75 @@ def feather_mask_vips(w: int, h: int, fpx: int) -> pyvips.Image:
     _mask_cache[key] = wm
     return wm
 
+
+def _similarity_with_optional_background(
+    img: pyvips.Image,
+    *,
+    scale: float | None = None,
+    angle: float | None = None,
+    background=None,
+) -> pyvips.Image:
+    """
+    Wrapper around libvips similarity() that optionally sets a background.
+    Falls back if the installed libvips/pyvips doesn't support the keyword.
+    """
+    kwargs: dict[str, object] = {}
+    if scale is not None:
+        kwargs["scale"] = scale
+    if angle is not None:
+        kwargs["angle"] = angle
+    if background is not None:
+        kwargs["background"] = background
+    try:
+        return img.similarity(**kwargs)
+    except TypeError:
+        kwargs.pop("background", None)
+        return img.similarity(**kwargs)
+
+
+def scale_canvas_if_needed(img: pyvips.Image, scale: float, background=None) -> pyvips.Image:
+    """
+    Uniformly scale the stitched image by 'scale'.
+
+    Matches stitch_h5data.py behavior: use vips similarity() for arbitrary factors.
+    """
+    scale = float(scale or 1.0)
+    if abs(scale - 1.0) < 1e-6:
+        return img
+    print(f"Scaling canvas: factor {scale:.6f} (similarity)")
+    return _similarity_with_optional_background(img, scale=scale, background=background)
+
+
+def rotate_canvas_if_needed(img: pyvips.Image, angle_deg: float, background=None) -> pyvips.Image:
+    """
+    Rotate the stitched image by angle_deg CCW.
+
+    Matches stitch_h5data.py behavior:
+    - For multiples of 90° use fast integer rotations.
+    - For arbitrary angles use similarity() (resampling).
+    """
+    angle_deg = float(angle_deg or 0.0)
+    if abs(angle_deg) < 1e-6:
+        return img
+
+    # normalize into [0, 360)
+    angle_norm = angle_deg % 360.0
+
+    # snap exact multiples of 90°
+    if abs(angle_norm - 90.0) < 1e-6:
+        print("Rotating canvas: 90° CCW")
+        return img.rot90()
+    if abs(angle_norm - 180.0) < 1e-6:
+        print("Rotating canvas: 180°")
+        return img.rot180()
+    if abs(angle_norm - 270.0) < 1e-6:
+        print("Rotating canvas: 270° CCW")
+        return img.rot270()
+
+    # arbitrary angle – keep the sign the user asked for
+    print(f"Rotating canvas: {angle_deg:.6f}° CCW (similarity)")
+    return _similarity_with_optional_background(img, angle=angle_deg, background=background)
+
 # ---- robust helpers ----
 def expected_tile_px(df_row, um_per_px_x, um_per_px_y):
     """Return expected (w,h) in px if TileWidth_um/TileHeight_um exist, else None."""
@@ -178,6 +247,7 @@ def main():
     # Default output directory: <dataset>/stitched
     ap.add_argument("--out-dir", default=None, help="Output directory (default: <dataset>/stitched)")
     ap.add_argument("--scale", type=float, default=0.5, help="Master scale factor (1.0 = full-res)")
+    ap.add_argument("--rotate", type=float, default=0.0, help="Optional rotation in degrees (CCW) applied to the final stitched image.")
     ap.add_argument("--feather-px", type=int, default=0, help="Feather width in pixels (0 = no feather)")
     ap.add_argument("--background", choices=["white","black"], default="white")
     ap.add_argument("--pyramid", action=argparse.BooleanOptionalAction, default=True)
@@ -236,9 +306,9 @@ def main():
     Wn = int(math.ceil(um_to_px_x(x_max_um)))
     Hn = int(math.ceil(um_to_px_y(y_max_um)))
     SCALE = float(args.scale)
-    W = max(1, int(round(Wn * SCALE)))
-    H = max(1, int(round(Hn * SCALE)))
-    print(f"Canvas (native): {Wn}×{Hn}  -> scale={SCALE}  =>  {W}×{H}")
+    W = max(1, int(Wn))
+    H = max(1, int(Hn))
+    print(f"Canvas (native): {Wn}×{Hn}  |  scale={SCALE}  rotate={args.rotate}")
 
     bgval = 255 if args.background.lower() == "white" else 0
     bg_rgb = [bgval, bgval, bgval]
@@ -300,7 +370,10 @@ def main():
             print(f"[warn] Z{z}: no readable tiles found; skipping this layer.")
             continue
 
-        print(f"\n=== Z{z}: composing {len(dfz)} tiles on {W}×{H} (feather={args.feather_px}px, channel={'gray' if single_band else 'rgb'}) ===")
+        print(
+            f"\n=== Z{z}: composing {len(dfz)} tiles on {W}×{H} "
+            f"(feather={args.feather_px}px, scale={SCALE}, rotate={args.rotate}, channel={'gray' if single_band else 'rgb'}) ==="
+        )
 
         bad_tiles = 0
 
@@ -311,8 +384,8 @@ def main():
 
             for r in tqdm(dfz.itertuples(index=False), total=len(dfz), desc=f"Z{z} compose"):
                 pos = int(getattr(r, "PosIndex", int(r.Index) // S))
-                x0  = int(round(um_to_px_x(float(r.X_rel_um)) * SCALE))
-                y0  = int(round(um_to_px_y(float(r.Y_rel_um)) * SCALE))
+                x0  = int(round(um_to_px_x(float(r.X_rel_um))))
+                y0  = int(round(um_to_px_y(float(r.Y_rel_um))))
 
                 exp = expected_tile_px(r, px_x_um, px_y_um)
                 a   = load_tile_pos_z_safe(images, pos, z, single_band, band_idx, exp_wh=exp)
@@ -337,10 +410,10 @@ def main():
                     h, w, c = a.shape
                     t = pyvips.Image.new_from_memory(np.ascontiguousarray(a).data, w, h, c, fmt).copy(interpretation="srgb")
 
-                if SCALE != 1.0:
-                    t = t.resize(SCALE, kernel="linear")
-
-                wm = feather_mask_vips(t.width, t.height, int(args.feather_px))
+                feather_px = int(args.feather_px)
+                if abs(SCALE - 1.0) > 1e-6 and feather_px > 0:
+                    feather_px = max(1, int(round(feather_px / SCALE)))
+                wm = feather_mask_vips(t.width, t.height, feather_px)
                 if single_band:
                     acc  = acc.insert(t * wm, x0, y0)
                 else:
@@ -369,8 +442,8 @@ def main():
 
             for r in tqdm(dfz.itertuples(index=False), total=len(dfz), desc=f"Z{z} compose"):
                 pos = int(getattr(r, "PosIndex", int(r.Index) // S))
-                x0  = int(round(um_to_px_x(float(r.X_rel_um)) * SCALE))
-                y0  = int(round(um_to_px_y(float(r.Y_rel_um)) * SCALE))
+                x0  = int(round(um_to_px_x(float(r.X_rel_um))))
+                y0  = int(round(um_to_px_y(float(r.Y_rel_um))))
 
                 exp = expected_tile_px(r, px_x_um, px_y_um)
                 a   = load_tile_pos_z_safe(images, pos, z, single_band, band_idx, exp_wh=exp)
@@ -395,8 +468,6 @@ def main():
                     h, w, c = a.shape
                     t = pyvips.Image.new_from_memory(np.ascontiguousarray(a).data, w, h, c, fmt).copy(interpretation="srgb")
 
-                if SCALE != 1.0:
-                    t = t.resize(SCALE, kernel="linear")
                 mosaic = mosaic.insert(t, x0, y0)
 
         if bad_tiles:
@@ -409,6 +480,11 @@ def main():
         except Exception:
             pass
 
+        # Apply global scale + rotation (matches stitch_h5data.py behavior)
+        bg = bgval if single_band else bg_rgb
+        save_im = scale_canvas_if_needed(save_im, SCALE, background=bg)
+        save_im = rotate_canvas_if_needed(save_im, args.rotate, background=bg)
+
         save_im.tiffsave(
             str(tiff_path),
             tile=True,
@@ -420,7 +496,7 @@ def main():
         print(f"✅ BigTIFF written: {tiff_path}")
 
         # preview
-        s = min(1.0, args.preview_max / max(W, H))
+        s = min(1.0, args.preview_max / max(save_im.width, save_im.height))
         prv = save_im.resize(s) if s < 1.0 else save_im
         prv.pngsave(str(prev_path), compression=6)
         print(f"✅ Preview PNG:   {prev_path}")
@@ -429,4 +505,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

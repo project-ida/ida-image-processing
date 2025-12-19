@@ -14,7 +14,7 @@ from typing import Iterable, Optional
 POLL_SECONDS   = 60                      # check once per minute
 GRACE_AFTER_FINISH_SECONDS = 5           # wait after detection before processing
 INDEX_NAME     = "summary_table.csv"     # identifies an h5 dataset root
-TRIGGER_NAME   = "ready_to_process.txt"   # when this file is present, the processing starts
+TRIGGER_NAME   = "ready_to_process.txt"  # when this file is present, the processing starts
 
 # Logs:
 LOG_NAME       = "auto_process.log"           # Real run
@@ -30,6 +30,10 @@ DZI_DEST: Optional[Path]
 DRY_RUN: bool = False   # global dry-run flag
 AGG_ROWS: int
 AGG_COLS: int
+AGG_RIGHT_OFFSET_PERCENT: float
+AGG_BOTTOM_OFFSET_PERCENT: float
+SKIP_EDS_AGGREGATION: bool
+DO_NOT_ROTATE_GRIDS: bool
 
 
 def ts() -> str:
@@ -131,26 +135,136 @@ def list_candidate_datasets_recursive(base: Path, dry_run: bool = False) -> Iter
         yield ds_dir
 
 
-def read_rotation_arg(ds_dir: Path, dry_run: bool = False) -> list[str]:
+def _parse_numeric_expr(expr: str) -> float:
     """
-    If <ds_dir>/rotation.txt exists, read the first line as a float (degrees).
-    Return ["--rotate", "<value>"] on success, else [].
+    Parse a numeric value or simple arithmetic expression safely.
 
-    NOTE: Angle is used literally (no sign flip). Put -3.0 in the file if you
-    want -3° rotation.
+    Supports examples like:
+        1.0
+        -3.5
+        -90+1.45
+        0.5-0.1
+        1*1.007
+        (1-0.002)*1.01
+
+    Only digits, +, -, *, /, decimal points, e/E, parentheses, and spaces
+    are allowed. Uses eval() with builtins disabled.
     """
-    rot_path = ds_dir / "rotation.txt"
-    if not rot_path.exists():
-        return []
+    expr = expr.strip()
+    # first try direct float
     try:
-        first_line = rot_path.read_text(encoding="utf-8").strip().splitlines()[0].strip()
-        val = float(first_line)
-        args = ["--rotate", str(val)]
-        log_ds(ds_dir, f"Using rotation from rotation.txt: {val} degrees", dry_run=dry_run)
-        return args
-    except Exception as e:
-        log_ds(ds_dir, f"rotation.txt present but not usable ({e}); continuing without rotation.", dry_run=dry_run)
-        return []
+        return float(expr)
+    except ValueError:
+        allowed = set("0123456789.+-eE*/() ")
+        if not expr or any(ch not in allowed for ch in expr):
+            raise ValueError(f"Unsupported numeric expression: {expr!r}")
+        val = eval(expr, {"__builtins__": None}, {})
+        return float(val)
+
+
+def read_transform_args(ds_dir: Path, dry_run: bool = False) -> list[str]:
+    """
+    Read rotation and scale from <ds_dir>/config.txt if present.
+
+      rotation=<float or simple expression>   (degrees, CCW)
+      scale=<float or simple expression>      (dimensionless)
+
+    Returns a list of CLI args like:
+      ["--scale", "<scale>", "--rotate", "<rotation>"]
+
+    - If scale is missing in config.txt, we fall back to the watcher
+      CLI --scale value.
+    - If rotation is missing, we simply omit --rotate.
+    """
+    cfg_path = ds_dir / "config.txt"
+    rotation_val = None
+    scale_val = None
+
+    if cfg_path.exists():
+        try:
+            text = cfg_path.read_text(encoding="utf-8")
+
+            for line in text.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip().lower()
+                value = value.strip()
+
+                if key == "rotation":
+                    rotation_val = _parse_numeric_expr(value)
+                elif key == "scale":
+                    scale_val = _parse_numeric_expr(value)
+
+            if rotation_val is not None:
+                log_ds(ds_dir,
+                       f"Using rotation from config.txt: {rotation_val} degrees",
+                       dry_run=dry_run)
+
+            if scale_val is not None:
+                log_ds(ds_dir,
+                       f"Using scale from config.txt: {scale_val}",
+                       dry_run=dry_run)
+
+        except Exception as e:
+            log_ds(
+                ds_dir,
+                f"config.txt present but transform not fully usable ({e}); "
+                f"falling back where possible.",
+                dry_run=dry_run,
+            )
+
+    # Fallback for scale: watcher CLI --scale
+    if scale_val is None:
+        try:
+            scale_val = float(SCALE)
+            log_ds(ds_dir,
+                   f"No scale in config.txt; using watcher CLI scale={scale_val}",
+                   dry_run=dry_run)
+        except Exception:
+            # Last resort, default 1.0
+            scale_val = 1.0
+            log_ds(ds_dir,
+                   "No usable scale from config.txt or CLI; defaulting to 1.0",
+                   dry_run=dry_run)
+
+    args: list[str] = []
+
+    # Always pass scale (so downstream scripts can rely on it)
+    args.extend(["--scale", str(scale_val)])
+
+    # Only pass rotation if we actually have one
+    if rotation_val is not None:
+        args.extend(["--rotate", str(rotation_val)])
+
+    return args
+
+
+def _grid_transform_args(all_args: list[str]) -> list[str]:
+    """
+    Take the full transform arg list and optionally strip out any
+    '--rotate <val>' pair if DO_NOT_ROTATE_GRIDS is set.
+
+    We always keep --scale.
+    """
+    if not DO_NOT_ROTATE_GRIDS:
+        return all_args
+
+    filtered: list[str] = []
+    skip_next = False
+    for a in all_args:
+        if skip_next:
+            skip_next = False
+            continue
+        if a == "--rotate":
+            skip_next = True
+            continue
+        filtered.append(a)
+
+    return filtered
 
 
 def run_processing(
@@ -163,8 +277,8 @@ def run_processing(
     Run the steps; return True on success.
 
     Steps:
-      1. stitch_h5data.py (with optional --rotate, --overwrite)
-      1.5 aggregate_eds_spectra2.py (with --rows/--cols)
+      1. stitch_h5data.py (with optional --rotate/--scale, --overwrite)
+      1.5 aggregate_eds_spectra2.py (with --rows/--cols and offset percents) [optional]
       2. dzi_from_bigtiff.py (on ds_dir/stitched, --no-skip-if-exists)
       2.5 create_selection_grid.py, create_metric_grid.py, create_stitching_grid.py
       3. move_dzi.py (optional, if dzi_destination_dir is set)
@@ -182,14 +296,14 @@ def run_processing(
     stitching_grid_script   = parent_dir / "create_stitching_grid.py"
     moving_script           = parent_dir / "move_dzi.py"
 
-    # Optional rotation argument from rotation.txt (per dataset)
-    rotate_args = read_rotation_arg(ds_dir, dry_run=dry_run)
+    # Rotation + scale arguments from config.txt / watcher CLI
+    transform_args = read_transform_args(ds_dir, dry_run=dry_run)
+    grid_transform_args = _grid_transform_args(transform_args)
 
     # ---------- Step 1: stitch ----------
     cmd1 = [
         sys.executable, str(stitch_script), str(ds_dir),
-        "--scale", SCALE,
-        *rotate_args,
+        *transform_args,
         "--overwrite",  # allow stitched BigTIFF overwrite
     ]
     log_msg = f"Would run: {' '.join(cmd1)}" if dry_run else f"Running: {' '.join(cmd1)}"
@@ -204,25 +318,27 @@ def run_processing(
         log_ds(ds_dir, "DRY-RUN: Skipping execution of stitch_h5data.py", dry_run=dry_run)
 
     # ---------- Step 1.5: aggregate EDS spectra ----------
-    # h5data_dir positional argument is the same dataset root that contains summary_table.csv
-    cmd_agg = [ 
-        sys.executable, str(aggregation_script),
-        "--rows", str(AGG_ROWS),
-        "--cols", str(AGG_COLS),
-        str(ds_dir),
-    ]
-    log_msg = f"Would run: {' '.join(cmd_agg)}" if dry_run else f"Running: {' '.join(cmd_agg)}"
-    log_ds(ds_dir, log_msg, dry_run=dry_run)
-    if not dry_run:
-        try:
-            subprocess.run(cmd_agg, check=True)
-        except subprocess.CalledProcessError as e:
-            log_ds(ds_dir, f"ERROR: aggregate_eds_spectra2 failed with code {e.returncode}", dry_run=dry_run)
-            # Not fatal for stitching/DZI, but likely important; decide policy:
-            # here we continue, but you could return False instead.
-        # no return here: we continue even if aggregation fails
+    if SKIP_EDS_AGGREGATION:
+        log_ds(ds_dir, "Skipping EDS aggregation step (per --skip-eds-aggregation).", dry_run=dry_run)
     else:
-        log_ds(ds_dir, "DRY-RUN: Skipping execution of aggregate_eds_spectra2.py", dry_run=dry_run)
+        cmd_agg = [
+            sys.executable, str(aggregation_script),
+            "--rows", str(AGG_ROWS),
+            "--cols", str(AGG_COLS),
+            "--right-offset-percent", str(AGG_RIGHT_OFFSET_PERCENT),
+            "--bottom-offset-percent", str(AGG_BOTTOM_OFFSET_PERCENT),
+            str(ds_dir),
+        ]
+        log_msg = f"Would run: {' '.join(cmd_agg)}" if dry_run else f"Running: {' '.join(cmd_agg)}"
+        log_ds(ds_dir, log_msg, dry_run=dry_run)
+        if not dry_run:
+            try:
+                subprocess.run(cmd_agg, check=True)
+            except subprocess.CalledProcessError as e:
+                log_ds(ds_dir, f"ERROR: aggregate_eds_spectra2 failed with code {e.returncode}", dry_run=dry_run)
+                # Not fatal; continue
+        else:
+            log_ds(ds_dir, "DRY-RUN: Skipping execution of aggregate_eds_spectra2.py", dry_run=dry_run)
 
     # ---------- Step 2: DZI from stitched ----------
     stitched_dir = ds_dir / "stitched"
@@ -248,7 +364,8 @@ def run_processing(
     sel_input = ds_dir / "aggregated-spectra"
     cmd_sel = [
         sys.executable, str(selection_grid_script),
-        str(sel_input)
+        str(sel_input),
+        *grid_transform_args,   # pass --scale and maybe --rotate (unless suppressed)
     ]
     log_msg = f"Would run: {' '.join(cmd_sel)}" if dry_run else f"Running: {' '.join(cmd_sel)}"
     log_ds(ds_dir, log_msg, dry_run=dry_run)
@@ -260,7 +377,7 @@ def run_processing(
     else:
         log_ds(ds_dir, "DRY-RUN: Skipping execution of create_selection_grid.py", dry_run=dry_run)
 
-    # metric_grid
+    # metric_grid (no scale/rotation arguments needed)
     cmd_metric = [
         sys.executable, str(metric_grid_script),
         str(ds_dir)
@@ -275,10 +392,11 @@ def run_processing(
     else:
         log_ds(ds_dir, "DRY-RUN: Skipping execution of create_metric_grid.py", dry_run=dry_run)
 
-    # stitching_grid
+    # stitching_grid (needs scale and maybe rotation)
     cmd_stitching = [
         sys.executable, str(stitching_grid_script),
-        str(ds_dir)
+        str(ds_dir),
+        *grid_transform_args,   # pass --scale and maybe --rotate
     ]
     log_msg = f"Would run: {' '.join(cmd_stitching)}" if dry_run else f"Running: {' '.join(cmd_stitching)}"
     log_ds(ds_dir, log_msg, dry_run=dry_run)
@@ -323,7 +441,7 @@ def parse_args():
     )
     ap.add_argument(
         "--scale", default="1.0",
-        help="Scale passed to stitch_h5data.py (default: 1.0)"
+        help="Default scale passed to stitch_h5data.py if config.txt has no 'scale=' (default: 1.0)"
     )
     ap.add_argument(
         "--dzi-destination", required=False,
@@ -338,6 +456,23 @@ def parse_args():
         help="Cols passed to aggregate_eds_spectra2.py via --cols (default: 3)"
     )
     ap.add_argument(
+        "--aggregation-right-offset-percent", type=float, default=10.0,
+        help="Stitching grid overlap to the right in percent (default: 10)"
+    )
+    ap.add_argument(
+        "--aggregation-bottom-offset-percent", type=float, default=10.0,
+        help="Stitching grid overlap at the bottom in percent (default: 10)"
+    )
+    ap.add_argument(
+        "--skip-eds-aggregation", action="store_true",
+        help="If set, skip running aggregate_eds_spectra2.py (Step 1.5)."
+    )
+    ap.add_argument(
+        "--do-not-rotate-grids", action="store_true",
+        help="Rotate stitched image as usual, but do NOT pass --rotate to "
+             "selection/stitching grid scripts (they only get --scale)."
+    )
+    ap.add_argument(
         "--dry-run", action="store_true",
         help="Preview only. Skips if any log (real or dry) exists and does not run subprocesses."
     )
@@ -345,7 +480,9 @@ def parse_args():
 
 
 def main():
-    global BASE_DIR, SCALE, DZI_DEST, MASTER_LOG_PATH, DRY_RUN, AGG_ROWS, AGG_COLS
+    global BASE_DIR, SCALE, DZI_DEST, MASTER_LOG_PATH, DRY_RUN
+    global AGG_ROWS, AGG_COLS, AGG_RIGHT_OFFSET_PERCENT, AGG_BOTTOM_OFFSET_PERCENT
+    global SKIP_EDS_AGGREGATION, DO_NOT_ROTATE_GRIDS
 
     args = parse_args()
     BASE_DIR = Path(args.base_dir)
@@ -354,6 +491,10 @@ def main():
     DRY_RUN = args.dry_run
     AGG_ROWS = args.aggregation_rows
     AGG_COLS = args.aggregation_cols
+    AGG_RIGHT_OFFSET_PERCENT = args.aggregation_right_offset_percent
+    AGG_BOTTOM_OFFSET_PERCENT = args.aggregation_bottom_offset_percent
+    SKIP_EDS_AGGREGATION = args.skip_eds_aggregation
+    DO_NOT_ROTATE_GRIDS = args.do_not_rotate_grids
 
     if not BASE_DIR.exists():
         print(f"Base folder does not exist: {BASE_DIR}")
@@ -365,8 +506,13 @@ def main():
     mode = " (DRY-RUN)" if DRY_RUN else ""
     log_master(
         f"Watching (recursive) {BASE_DIR} (scripts in {script_dir}) | "
-        f"scale={SCALE} dzi-destination={DZI_DEST} "
-        f"aggregation_rows={AGG_ROWS} aggregation_cols={AGG_COLS}{mode}"
+        f"default_scale={SCALE} dzi-destination={DZI_DEST} "
+        f"aggregation_rows={AGG_ROWS} aggregation_cols={AGG_COLS} "
+        f"agg_right_offset%={AGG_RIGHT_OFFSET_PERCENT} "
+        f"agg_bottom_offset%={AGG_BOTTOM_OFFSET_PERCENT} "
+        f"skip_eds_agg={SKIP_EDS_AGGREGATION} "
+        f"do_not_rotate_grids={DO_NOT_ROTATE_GRIDS}"
+        f"{mode}"
     )
 
     while True:

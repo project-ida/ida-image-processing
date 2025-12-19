@@ -24,6 +24,7 @@ Differences to the heatmap script:
 import os
 import json
 import argparse
+import math
 from glob import glob
 
 
@@ -65,6 +66,18 @@ def main():
         help="Shrink each rect by this percent on EACH side in microns space (default 0.0). "
              "E.g. 3.0 → shrink width/height by 3%% on left+right and 3%% on top+bottom."
     )
+    ap.add_argument(
+        "--rotate",
+        type=float,
+        default=0.0,
+        help="Optional global rotation in degrees (CCW) applied to quadrant positions."
+    )
+    ap.add_argument(
+        "--scale",
+        type=float,
+        default=1.0,
+        help="Global scale factor (unitless) applied to quadrant positions and sizes (default 1.0)."
+    )
 
     args = ap.parse_args()
 
@@ -86,6 +99,17 @@ def main():
         raise SystemExit(f"No JSON files found in {in_dir}")
 
     folder_name = os.path.basename(os.path.normpath(in_dir))
+
+    # precompute rotation, if any
+    angle_deg = float(args.rotate or 0.0)
+    use_rotation = abs(angle_deg) > 1e-9
+    if use_rotation:
+        theta = math.radians(angle_deg)
+        c = math.cos(theta)
+        s = math.sin(theta)
+
+    # global, unitless scale factor in microns space
+    scale = float(args.scale or 1.0)
 
     rectangles = []
 
@@ -111,14 +135,14 @@ def main():
             base_y = float(e["Y_rel_um"])
             tile_w = float(e["TileWidth_um"])
             tile_h = float(e["TileHeight_um"])
-            c = int(e["colnum"])
-            r = int(e["rownum"])
+            c_idx = int(e["colnum"])
+            r_idx = int(e["rownum"])
 
             # preferred explicit quadrant geometry if present
             qw = float(e.get("quad_width_um", tile_w / cols))
             qh = float(e.get("quad_height_um", tile_h / rows))
-            qx = base_x + float(e.get("quad_x_um", c * (tile_w / cols)))
-            qy = base_y + float(e.get("quad_y_um", r * (tile_h / rows)))
+            qx = base_x + float(e.get("quad_x_um", c_idx * (tile_w / cols)))
+            qy = base_y + float(e.get("quad_y_um", r_idx * (tile_h / rows)))
 
             # optional shrinking — we stay in microns
             if args.shrink_pct > 0:
@@ -133,23 +157,36 @@ def main():
                 if qh < 0:
                     qh = 0
 
+            # global rotation of the quadrant position
+            if use_rotation:
+                xr = qx * c - qy * s
+                yr = qx * s + qy * c
+            else:
+                xr, yr = qx, qy
+
+            # apply global scale factor in microns space
+            xs = xr * scale
+            ys = yr * scale
+            w_scaled = qw * scale
+            h_scaled = qh * scale
+
             rect = {
                 "type": "rect",
                 "units": "microns",
-                "x": qx,
-                "y": qy,
-                "width": qw,
-                "height": qh,
+                "x": xs,
+                "y": ys,
+                "width": w_scaled,
+                "height": h_scaled,
                 "fill": args.fill,
                 "fillOpacity": args.fill_opacity,
                 "stroke": args.stroke,
                 "strokeWidthPx": args.stroke_px,
                 # keep the viewer metadata:
                 "basename": e.get("basename", ""),
-                "colnum": c,
-                "rownum": r,
+                "colnum": c_idx,
+                "rownum": r_idx,
                 "srcJson": src_json_rel,
-                "label": f'{e.get("basename","")} · r{r}, c{c}',
+                "label": f'{e.get("basename","")} · r{r_idx}, c{c_idx}',
             }
 
             rectangles.append(rect)

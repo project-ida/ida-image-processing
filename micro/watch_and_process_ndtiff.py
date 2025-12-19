@@ -73,7 +73,7 @@ def list_candidate_datasets_recursive(base: Path, dry_run: bool = False) -> Iter
     - Normal mode: skip if auto_process.log exists
     - Dry-run mode: skip if EITHER auto_process.log OR auto_process.dryrun.log exists
     - If TRIGGER_NAME contains a line like "number_of_files=<N>", only yield once at least
-      N (non-hidden) files exist in that same directory (excluding trigger/log files).
+      N .tif files exist in that same directory.
     """
     if not base.exists():
         return
@@ -123,9 +123,8 @@ def list_candidate_datasets_recursive(base: Path, dry_run: bool = False) -> Iter
                 if expected < 0:
                     continue
                 if expected > 0:
-                    ignore = {TRIGGER_NAME, LOG_NAME, LOG_NAME_DRY}
-                    present = sum(1 for f in files if f not in ignore and not f.startswith("."))
-                    if present < expected:
+                    present_tifs = sum(1 for f in files if f.lower().endswith(".tif"))
+                    if present_tifs < expected:
                         continue
 
         yield ds_dir

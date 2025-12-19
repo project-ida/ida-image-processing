@@ -8,6 +8,7 @@ plus an 8-bit preview PNG.
 Changes vs. previous version:
 - Use ONE global um_per_px for both axes (from --um-per-px or CSV).
 - Pixel offsets: x_px = round(X_rel_um / um_per_px), y_px = round(Y_rel_um / um_per_px).
+- Optional global scale and rotation are applied to the final stitched image.
 """
 
 import os, sys, csv, math, time, argparse
@@ -133,6 +134,47 @@ def save_preview_png(img16: pyvips.Image, out_png: Path, lo: float, hi: float, g
     out = out.copy(interpretation="b-w")
     out.pngsave(str(out_png), compression=3, strip=True)
 
+def scale_canvas_if_needed(img: pyvips.Image, scale: float) -> pyvips.Image:
+    """
+    Uniformly scale the stitched image by 'scale'.
+
+    Uses vips similarity() for arbitrary (non-integer) factors.
+    """
+    scale = float(scale or 1.0)
+    if abs(scale - 1.0) < 1e-6:
+        return img
+    print(f"Scaling canvas: factor {scale:.6f} (similarity)")
+    return img.similarity(scale=scale)
+
+def rotate_canvas_if_needed(img: pyvips.Image, angle_deg: float) -> pyvips.Image:
+    """
+    Rotate the stitched image by angle_deg CCW.
+
+    - For multiples of 90° use fast integer rotations.
+    - For arbitrary angles use similarity() (resampling).
+    """
+    angle_deg = float(angle_deg or 0.0)
+    if abs(angle_deg) < 1e-6:
+        return img
+
+    # normalize into [0, 360)
+    angle_norm = angle_deg % 360.0
+
+    # snap exact multiples of 90°
+    if abs(angle_norm - 90.0) < 1e-6:
+        print("Rotating canvas: 90° CCW")
+        return img.rot90()
+    if abs(angle_norm - 180.0) < 1e-6:
+        print("Rotating canvas: 180°")
+        return img.rot180()
+    if abs(angle_norm - 270.0) < 1e-6:
+        print("Rotating canvas: 270° CCW")
+        return img.rot270()
+
+    # arbitrary angle – keep the sign the user asked for
+    print(f"Rotating canvas: {angle_deg:.6f}° CCW (similarity)")
+    return img.similarity(angle=angle_deg)
+
 # ---------- CLI ----------
 
 def parse_args():
@@ -140,9 +182,10 @@ def parse_args():
     p.add_argument("folder", help="Folder that contains summary_table.csv and NPZ files")
     p.add_argument("--um-per-px", type=float, default=None,
                    help="Global µm per pixel (if omitted, read from CSV first row and require X==Y).")
-    p.add_argument("--scale", type=float, default=1.0, help="Extra scale factor (default 1.0)")
+    p.add_argument("--scale", type=float, default=1.0,
+                   help="Global scale factor applied to the final stitched image (default 1.0).")
     p.add_argument("--rotate", type=float, default=0.0,
-                   help="Optional rotation in degrees (CCW) applied to stage coordinates before stitching.")
+                   help="Optional rotation in degrees (CCW) applied to the final stitched image.")
     p.add_argument("--tile", type=int, default=128, help="TIFF tile size (default 128)")
     p.add_argument("--workers", type=int, default=2, help="libvips worker threads")
     p.add_argument("--overwrite", action=argparse.BooleanOptionalAction, default=True,
@@ -219,21 +262,12 @@ def main():
 
     Xum = np.asarray(Xum, dtype=np.float64)
     Yum = np.asarray(Yum, dtype=np.float64)
-    # ---- optional rotation of stage coordinates (degrees, CCW) ----
-    if abs(getattr(args, "rotate", 0.0)) > 1e-9:
-        theta = math.radians(args.rotate)
-        c, s = math.cos(theta), math.sin(theta)
-        Xr = Xum * c - Yum * s
-        Yr = Xum * s + Yum * c
-        Xum, Yum = Xr, Yr
-        print(f"Applying rotation: {args.rotate:.6f} deg")
     Wpx = np.asarray(Wpx, dtype=np.int32)
     Hpx = np.asarray(Hpx, dtype=np.int32)
 
-    # ---- µm -> px using ONE global um_per_px (optionally scaled) ----
-    s = float(args.scale)
-    x_off_px = np.round((Xum / um_per_px) * s).astype(np.int64)
-    y_off_px = np.round((Yum / um_per_px) * s).astype(np.int64)
+    # ---- µm -> px using ONE global um_per_px (no scale here; scale is applied to the final canvas) ----
+    x_off_px = np.round(Xum / um_per_px).astype(np.int64)
+    y_off_px = np.round(Yum / um_per_px).astype(np.int64)
 
     # Rebase so minimum is (0,0)
     x_off_px -= int(x_off_px.min())
@@ -242,7 +276,7 @@ def main():
     # Canvas size
     canvas_w = int((x_off_px + Wpx).max())
     canvas_h = int((y_off_px + Hpx).max())
-    print(f"Canvas: {canvas_w} x {canvas_h}  |  um_per_px={um_per_px}  scale={s}")
+    print(f"Canvas: {canvas_w} x {canvas_h}  |  um_per_px={um_per_px}  scale={args.scale}  rotate={args.rotate}")
 
     # Compose
     canvas = build_canvas_u16(canvas_w, canvas_h)
@@ -279,6 +313,10 @@ def main():
 
     bar.close()
     print(f"Z0 NPZ stats -> min={g_min}, max={g_max}")
+
+    # ---- scale + rotate final stitched canvas, if requested ----
+    canvas = scale_canvas_if_needed(canvas, args.scale)
+    canvas = rotate_canvas_if_needed(canvas, args.rotate)
 
     # Save BigTIFF
     out_dir.mkdir(parents=True, exist_ok=True)

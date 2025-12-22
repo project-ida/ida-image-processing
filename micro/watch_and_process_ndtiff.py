@@ -124,7 +124,7 @@ def list_candidate_datasets_recursive(base: Path, dry_run: bool = False) -> Iter
                 if expected < 0:
                     continue
                 if expected > 0:
-                    present_tifs = sum(1 for f in files if f.lower().endswith(".tif",".tiff"))
+                    present_tifs = sum(1 for f in files if f.lower().endswith((".tif", ".tiff")))
                     if present_tifs < expected:
                         continue
 

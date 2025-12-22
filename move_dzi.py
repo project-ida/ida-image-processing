@@ -132,6 +132,25 @@ def safe_copy_file(src: Path, dst: Path, overwrite: bool) -> None:
     shutil.copy2(str(src), str(dst))
 
 
+def safe_copy_dir(src: Path, dst: Path, overwrite: bool) -> None:
+    """
+    Copy an entire directory tree src -> dst.
+    If dst exists:
+      - overwrite=False: raise FileExistsError
+      - overwrite=True: remove dst then copy
+    """
+    if dst.exists():
+        if not overwrite:
+            raise FileExistsError(f"Destination already exists: {dst}")
+        if dst.is_dir():
+            shutil.rmtree(dst)
+        else:
+            dst.unlink()
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(src, dst)
+
+
 def move_one_pair(
     dzi_path: Path,
     dest_root: Path,
@@ -257,7 +276,7 @@ def main():
                     aggspec_src = origin_parent / "aggregated-spectra"
                     if aggspec_src.is_dir():
                         aggspec_dst = target_dir / "aggregated-spectra"
-                        print(f"[DRY-RUN] Would move aggregated-spectra: {aggspec_src} -> {aggspec_dst}")
+                        print(f"[DRY-RUN] Would copy aggregated-spectra: {aggspec_src} -> {aggspec_dst}")
                         aggspec_moved = True
 
                 # New: config.txt (parent of origin) – copy in real run
@@ -311,10 +330,10 @@ def main():
                 if aggspec_src.is_dir():
                     aggspec_dst = target_dir / "aggregated-spectra"
                     try:
-                        safe_move(aggspec_src, aggspec_dst, args.overwrite)
-                        print(f"Moved aggregated-spectra: {aggspec_src} -> {aggspec_dst}")
+                        safe_copy_dir(aggspec_src, aggspec_dst, args.overwrite)
+                        print(f"Copied aggregated-spectra: {aggspec_src} -> {aggspec_dst}")
                     except Exception as e:
-                        msg = f"ERROR moving aggregated-spectra {aggspec_src} -> {aggspec_dst}: {e}"
+                        msg = f"ERROR copying aggregated-spectra {aggspec_src} -> {aggspec_dst}: {e}"
                         print(msg, file=sys.stderr)
                         errors.append(msg)
                     aggspec_moved = True

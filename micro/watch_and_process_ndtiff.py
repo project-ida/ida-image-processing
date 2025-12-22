@@ -130,26 +130,120 @@ def list_candidate_datasets_recursive(base: Path, dry_run: bool = False) -> Iter
         yield ds_dir
 
 
-def read_rotation_arg(ds_dir: Path, dry_run: bool = False) -> list[str]:
+def _parse_numeric_expr(expr: str) -> float:
     """
-    If <ds_dir>/rotation.txt exists, read the first line as a float (degrees).
-    Return ["--rotate", "<value>"] on success, else [].
+    Parse a numeric value or simple arithmetic expression safely.
 
-    NOTE: Angle is used literally (no sign flip). Put -3.0 in the file if you
-    want -3° rotation.
+    Supports examples like:
+        1.0
+        -3.5
+        -90+1.45
+        0.5-0.1
+        1*1.007
+        (1-0.002)*1.01
+
+    Only digits, +, -, *, /, decimal points, e/E, parentheses, and spaces
+    are allowed. Uses eval() with builtins disabled.
     """
-    rot_path = ds_dir / "rotation.txt"
-    if not rot_path.exists():
-        return []
+    expr = expr.strip()
+    # first try direct float
     try:
-        first_line = rot_path.read_text(encoding="utf-8").strip().splitlines()[0].strip()
-        val = float(first_line)
-        args = ["--rotate", str(val)]
-        log_ds(ds_dir, f"Using rotation from rotation.txt: {val} degrees", dry_run=dry_run)
-        return args
-    except Exception as e:
-        log_ds(ds_dir, f"rotation.txt present but not usable ({e}); continuing without rotation.", dry_run=dry_run)
-        return []
+        return float(expr)
+    except ValueError:
+        allowed = set("0123456789.+-eE*/() ")
+        if not expr or any(ch not in allowed for ch in expr):
+            raise ValueError(f"Unsupported numeric expression: {expr!r}")
+        val = eval(expr, {"__builtins__": None}, {})
+        return float(val)
+
+
+def read_transform_args(ds_dir: Path, dry_run: bool = False) -> list[str]:
+    """
+    Read rotation and scale from <ds_dir>/config.txt if present.
+
+      rotation=<float or simple expression>   (degrees, CCW)
+      scale=<float or simple expression>      (dimensionless)
+
+    Returns a list of CLI args like:
+      ["--scale", "<scale>", "--rotate", "<rotation>"]
+
+    - If scale is missing in config.txt, we fall back to the watcher
+      CLI --scale value.
+    - If rotation is missing, we simply omit --rotate.
+    """
+    cfg_path = ds_dir / "config.txt"
+    rotation_val = None
+    scale_val = None
+
+    if cfg_path.exists():
+        try:
+            text = cfg_path.read_text(encoding="utf-8")
+
+            for line in text.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip().lower()
+                value = value.strip()
+
+                if key == "rotation":
+                    rotation_val = _parse_numeric_expr(value)
+                elif key == "scale":
+                    scale_val = _parse_numeric_expr(value)
+
+            if rotation_val is not None:
+                log_ds(
+                    ds_dir,
+                    f"Using rotation from config.txt: {rotation_val} degrees",
+                    dry_run=dry_run,
+                )
+
+            if scale_val is not None:
+                log_ds(
+                    ds_dir,
+                    f"Using scale from config.txt: {scale_val}",
+                    dry_run=dry_run,
+                )
+
+        except Exception as e:
+            log_ds(
+                ds_dir,
+                f"config.txt present but transform not fully usable ({e}); "
+                f"falling back where possible.",
+                dry_run=dry_run,
+            )
+
+    # Fallback for scale: watcher CLI --scale
+    if scale_val is None:
+        try:
+            scale_val = float(SCALE)
+            log_ds(
+                ds_dir,
+                f"No scale in config.txt; using watcher CLI scale={scale_val}",
+                dry_run=dry_run,
+            )
+        except Exception:
+            # Last resort, default 1.0
+            scale_val = 1.0
+            log_ds(
+                ds_dir,
+                "No usable scale from config.txt or CLI; defaulting to 1.0",
+                dry_run=dry_run,
+            )
+
+    args: list[str] = []
+
+    # Always pass scale (so downstream scripts can rely on it)
+    args.extend(["--scale", str(scale_val)])
+
+    # Only pass rotation if we actually have one
+    if rotation_val is not None:
+        args.extend(["--rotate", str(rotation_val)])
+
+    return args
 
 
 def run_processing(
@@ -163,7 +257,7 @@ def run_processing(
 
     - Respects dry_run: logs "Would run:" and does not execute subprocesses.
     - Includes:
-        * rotation via rotation.txt (passed to stitch_ndtiff.py as --rotate)
+        * rotation/scale via config.txt (falls back to watcher --scale)
         * --overwrite to stitch_ndtiff.py
         * --split-channel and --no-skip-if-exists to dzi_from_bigtiff.py
         * --use-greatgrandparent-folder-name and --overwrite to move_dzi.py
@@ -177,15 +271,14 @@ def run_processing(
     stitching_grid_script = script_dir.parent / "create_stitching_grid.py"
     moving_script = script_dir.parent / "move_dzi.py"
 
-    # Optional rotation argument from rotation.txt (per dataset)
-    rotate_args = read_rotation_arg(ds_dir, dry_run=dry_run)
+    # Rotation + scale arguments from config.txt / watcher CLI
+    transform_args = read_transform_args(ds_dir, dry_run=dry_run)
 
     # Step 1: stitch
     cmd1 = [
         sys.executable, str(stitch_script), str(ds_dir),
-        "--scale", SCALE,
+        *transform_args,
         "--channel", CHANNEL,
-        *rotate_args,
         "--overwrite",  # allow stitched BigTIFF overwrite
     ]
     log_msg = f"Would run: {' '.join(cmd1)}" if dry_run else f"Running: {' '.join(cmd1)}"
@@ -237,7 +330,8 @@ def run_processing(
     # stitching_grid
     cmd_stitching = [
         sys.executable, str(stitching_grid_script),
-        str(ds_dir)
+        str(ds_dir),
+        *transform_args,
     ]
     log_msg = f"Would run: {' '.join(cmd_stitching)}" if dry_run else f"Running: {' '.join(cmd_stitching)}"
     log_ds(ds_dir, log_msg, dry_run=dry_run)
@@ -282,7 +376,7 @@ def parse_args():
     )
     ap.add_argument(
         "--scale", default="1.0",
-        help="Scale passed to stitch_ndtiff.py (default: 1.0)"
+        help="Default scale passed to stitch_ndtiff.py if config.txt has no 'scale=' (default: 1.0)"
     )
     ap.add_argument(
         "--channel", default="g",
@@ -319,7 +413,7 @@ def main():
     mode = " (DRY-RUN)" if DRY_RUN else ""
     log_master(
         f"Watching (recursive) {BASE_DIR} (scripts in {script_dir}) | "
-        f"scale={SCALE} channel={CHANNEL} dzi-destination={DZI_DEST}{mode}"
+        f"default_scale={SCALE} channel={CHANNEL} dzi-destination={DZI_DEST}{mode}"
     )
 
     while True:

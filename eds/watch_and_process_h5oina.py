@@ -295,6 +295,7 @@ def run_processing(
     metric_grid_script      = parent_dir / "create_metric_grid.py"
     stitching_grid_script   = parent_dir / "create_stitching_grid.py"
     moving_script           = parent_dir / "move_dzi.py"
+    aggregation_dir         = ds_dir / "aggregated-spectra"
 
     # Rotation + scale arguments from config.txt / watcher CLI
     transform_args = read_transform_args(ds_dir, dry_run=dry_run)
@@ -320,6 +321,8 @@ def run_processing(
     # ---------- Step 1.5: aggregate EDS spectra ----------
     if SKIP_EDS_AGGREGATION:
         log_ds(ds_dir, "Skipping EDS aggregation step (per --skip-eds-aggregation).", dry_run=dry_run)
+    elif aggregation_dir.exists():
+        log_ds(ds_dir, "Skipping EDS aggregation: aggregated-spectra already exists.", dry_run=dry_run)
     else:
         cmd_agg = [
             sys.executable, str(aggregation_script),
@@ -361,7 +364,7 @@ def run_processing(
     # ---------- Step 2.5: create overlay grids ----------
 
     # selection_grid (uses aggregated-spectra folder)
-    sel_input = ds_dir / "aggregated-spectra"
+    sel_input = aggregation_dir
     cmd_sel = [
         sys.executable, str(selection_grid_script),
         str(sel_input),

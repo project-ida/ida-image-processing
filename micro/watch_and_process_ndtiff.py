@@ -10,6 +10,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import Iterable, Optional
 from ndstorage import Dataset
+import traceback
 
 # ---------- fixed config ----------
 POLL_SECONDS   = 60                      # check once per minute
@@ -443,7 +444,8 @@ def main():
             print("Exiting on Ctrl+C")
             break
         except Exception as e:
-            log_master(f"Top-level loop error: {e}")
+            #log_master(f"Top-level loop error: {e}")
+            log_master("Top-level loop error:\n" + traceback.format_exc())
             time.sleep(POLL_SECONDS)
 
 

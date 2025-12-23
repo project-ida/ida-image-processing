@@ -1,4 +1,5 @@
 import os
+import re
 import h5py
 import numpy as np
 from tqdm import tqdm
@@ -101,13 +102,23 @@ def main():
 
     os.makedirs(args.output_folder, exist_ok=True)
 
+    def natural_sort_key(s: str):
+        parts = re.split(r"(\d+)", s)
+        key = []
+        for part in parts:
+            if part.isdigit():
+                key.append((1, int(part)))
+            else:
+                key.append((0, part.lower()))
+        return key
+
     candidates = []
     for root, _, files in os.walk(args.input_folder):
         for file in files:
             if file.endswith(".h5oina") and "Montaged" not in file:
                 candidates.append(os.path.join(root, file))
 
-    candidates.sort(key=lambda p: os.path.relpath(p, args.input_folder).lower())
+    candidates.sort(key=lambda p: natural_sort_key(os.path.relpath(p, args.input_folder)))
 
     total = len(candidates)
     if total == 0:

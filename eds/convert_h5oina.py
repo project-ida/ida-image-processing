@@ -107,6 +107,8 @@ def main():
             if file.endswith(".h5oina") and "Montaged" not in file:
                 candidates.append(os.path.join(root, file))
 
+    candidates.sort(key=lambda p: os.path.relpath(p, args.input_folder).lower())
+
     total = len(candidates)
     if total == 0:
         print(f"No .h5oina files found in: {args.input_folder}")

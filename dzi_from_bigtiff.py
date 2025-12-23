@@ -7,6 +7,7 @@
 
 import os, re, time, argparse, math
 from pathlib import Path
+from typing import Optional
 
 # ---- libvips env (must be set before importing pyvips) -----------------------
 os.environ.setdefault("VIPS_CONCURRENCY", "2")  # worker threads (best-effort)
@@ -145,7 +146,64 @@ def percentile_from_hist(counts, lo_p, hi_p):
     hi = max(lo + 1.0, hi)
     return lo, hi
 
-def choose_window(img: pyvips.Image, norm: str, clip_percent: float, lo_abs, hi_abs):
+def _corner_background_value(band0: pyvips.Image) -> Optional[float]:
+    """
+    If all 4 corners share the same value, treat it as a likely background fill.
+
+    Returns the corner value as float, else None.
+    """
+    try:
+        w, h = band0.width, band0.height
+        if w <= 0 or h <= 0:
+            return None
+        corners = [
+            (0, 0),
+            (w - 1, 0),
+            (0, h - 1),
+            (w - 1, h - 1),
+        ]
+        vals: list[float] = []
+        for x, y in corners:
+            # crop 1×1 and average -> the pixel value (works across pyvips versions)
+            vals.append(float(band0.crop(x, y, 1, 1).avg()))
+        if max(vals) - min(vals) <= 1e-6:
+            return vals[0]
+    except Exception:
+        return None
+    return None
+
+
+def _hist_index_for_value(fmt: str, value: float, n_bins: int) -> Optional[int]:
+    """
+    Map a pixel value to a histogram bin index for vips.hist_find().
+
+    Only intended for small integer types used here (uchar/ushort/char/short).
+    """
+    try:
+        idx = int(round(float(value)))
+    except Exception:
+        return None
+
+    if fmt == "char":
+        idx -= -128
+    elif fmt == "short":
+        idx -= -32768
+
+    if 0 <= idx < n_bins:
+        return idx
+    return None
+
+
+def choose_window(
+    img: pyvips.Image,
+    norm: str,
+    clip_percent: float,
+    lo_abs,
+    hi_abs,
+    *,
+    ignore_background: bool = True,
+    background_value: Optional[float] = None,
+):
     """
     Decide lo/hi in the *native* domain.
     - integer types: use exact hist_find() percentiles
@@ -174,8 +232,25 @@ def choose_window(img: pyvips.Image, norm: str, clip_percent: float, lo_abs, hi_
         if fmt in ("uchar", "char", "ushort", "short", "uint", "int"):
             h = band0.hist_find()
             counts = _vips_to_numpy(h).reshape(-1)
+            bg_ignored = False
+            if ignore_background:
+                bg = background_value if background_value is not None else _corner_background_value(band0)
+                if bg is not None:
+                    idx = _hist_index_for_value(fmt, bg, int(counts.size))
+                    total = float(counts.sum())
+                    if idx is not None and total > 0:
+                        frac = float(counts[idx]) / total
+                        # Only ignore if it looks like a real background fill (>=1% of pixels).
+                        if frac >= 0.01:
+                            counts = counts.copy()
+                            counts[idx] = 0
+                            bg_ignored = True
+
             lo, hi = percentile_from_hist(counts, p, p)
-            return lo, hi, f"percentile (±{p}%)"
+            why = f"percentile (±{p}%)"
+            if bg_ignored:
+                why += " (bg ignored)"
+            return lo, hi, why
         # floats -> sample
         try:
             vmin, vmax = float(band0.min()), float(band0.max())
@@ -185,10 +260,24 @@ def choose_window(img: pyvips.Image, norm: str, clip_percent: float, lo_abs, hi_
         scale = max((band0.width * band0.height) / target, 1.0)
         band_s = band0.resize(1.0 / math.sqrt(scale)) if scale > 1.0 else band0
         arr = _vips_to_numpy(band_s)[:, :, 0].astype("float32", copy=False)
+        bg_ignored = False
+        if ignore_background:
+            bg = background_value if background_value is not None else _corner_background_value(band_s)
+            if bg is not None:
+                import numpy as np
+                mask = ~np.isclose(arr, float(bg), atol=1e-6)
+                if mask.any():
+                    frac = 1.0 - (float(mask.sum()) / float(mask.size))
+                    if frac >= 0.01:
+                        arr = arr[mask]
+                        bg_ignored = True
         import numpy as np
         lo, hi = np.percentile(arr, [p, 100.0 - p])
         if hi <= lo: hi = lo + 1.0
-        return float(lo), float(hi), f"percentile (±{p}%)"
+        why = f"percentile (±{p}%)"
+        if bg_ignored:
+            why += " (bg ignored)"
+        return float(lo), float(hi), why
 
     # none
     lo, hi = float(band0.min()), float(band0.max())
@@ -260,6 +349,41 @@ def dzsave_with_progress(img: pyvips.Image, outbase: str, desc: str, **opts):
         except Exception: pass
     print(f"✅  {desc} -> {outbase}.dzi  ({time.time()-t0:.1f}s)")
 
+def _resolve_background_value(img_native: pyvips.Image, args) -> Optional[float]:
+    """
+    Resolve the background value to ignore during windowing.
+
+    Precedence:
+      1) --background-value (explicit numeric)
+      2) --background {white,black}
+      3) None (auto from corners inside choose_window)
+    """
+    if args.background_value is not None:
+        return float(args.background_value)
+
+    mode = str(getattr(args, "background", "auto")).lower()
+    if mode == "auto":
+        return None
+    if mode == "black":
+        return 0.0
+    if mode == "white":
+        band0 = img_native.extract_band(0) if img_native.bands > 1 else img_native
+        fmt = band0.format
+        max_map = {
+            "uchar": 255.0,
+            "ushort": 65535.0,
+            "char": 127.0,
+            "short": 32767.0,
+        }
+        if fmt in max_map:
+            return max_map[fmt]
+        try:
+            return float(band0.max())
+        except Exception:
+            return None
+
+    return None
+
 # ---- CLI ---------------------------------------------------------------------
 def parse_args():
     p = argparse.ArgumentParser(description="Create DZI (DeepZoom) pyramids from mosaics in a folder.")
@@ -294,6 +418,16 @@ def parse_args():
                    help="Absolute lo for --norm fixed")
     p.add_argument("--hi", type=float, default=None,
                    help="Absolute hi for --norm fixed")
+    p.add_argument("--ignore-background", action=argparse.BooleanOptionalAction, default=False,
+                   help="Ignore uniform corner background when computing window (default false)")
+    p.add_argument(
+        "--background",
+        choices=["auto", "white", "black"],
+        default="auto",
+        help="Convenience background to ignore (only used with --ignore-background): auto=corners, white=max, black=0",
+    )
+    p.add_argument("--background-value", type=float, default=None,
+                   help="Explicit background value to ignore (only used with --ignore-background)")
     return p.parse_args()
 
 # ---- main --------------------------------------------------------------------
@@ -346,7 +480,16 @@ def main():
 
         # Decide window and map to 8-bit
         print("  [PASS 2/3] Computing window + mapping to 8-bit for DZI...")
-        lo, hi, why = choose_window(img_native, args.norm, args.clip_percent, args.lo, args.hi)
+        bg_value = _resolve_background_value(img_native, args) if args.ignore_background else None
+        lo, hi, why = choose_window(
+            img_native,
+            args.norm,
+            args.clip_percent,
+            args.lo,
+            args.hi,
+            ignore_background=bool(args.ignore_background),
+            background_value=bg_value,
+        )
         print(f"    → u8 mapping: lo={int(round(lo))}, hi={int(round(hi))} (norm={why})")
         img8 = map_to_u8(img_native, lo, hi)
 

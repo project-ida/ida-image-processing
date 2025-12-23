@@ -300,6 +300,8 @@ def run_processing(
         str(stitched_dir),
         "--split-channel",
         "--no-skip-if-exists",   # force regeneration of DZIs
+        "--ignore-background",
+        "--background", "white",
     ]
     log_msg = f"Would run: {' '.join(cmd2)}" if dry_run else f"Running: {' '.join(cmd2)}"
     log_ds(ds_dir, log_msg, dry_run=dry_run)

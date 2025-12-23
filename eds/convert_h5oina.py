@@ -101,16 +101,26 @@ def main():
 
     os.makedirs(args.output_folder, exist_ok=True)
 
-    file_count = 0
+    candidates = []
     for root, _, files in os.walk(args.input_folder):
         for file in files:
             if file.endswith(".h5oina") and "Montaged" not in file:
-                file_count += 1
-                if file_count <= args.skipfiles:
-                    continue
-                filepath = os.path.join(root, file)
-                print(f"Starting processing for file: {file}")
-                process_h5oina_file(filepath, args.output_folder)
+                candidates.append(os.path.join(root, file))
+
+    total = len(candidates)
+    if total == 0:
+        print(f"No .h5oina files found in: {args.input_folder}")
+        return
+
+    if args.skipfiles > 0:
+        print(f"Skipping first {args.skipfiles} file(s) out of {total}")
+
+    for idx, filepath in enumerate(candidates, start=1):
+        if idx <= args.skipfiles:
+            continue
+        file = os.path.basename(filepath)
+        print(f"Starting processing ({idx} out of {total}) for file: {file}")
+        process_h5oina_file(filepath, args.output_folder)
 
     print("All specified files have been processed.")
 

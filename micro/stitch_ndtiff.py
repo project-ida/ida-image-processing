@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, math, argparse, shutil
+import os, math, json, argparse, shutil
 from pathlib import Path
 
 # enable libvips progress + set workers BEFORE importing pyvips
@@ -37,14 +37,43 @@ def parse_px_um_from_affine(summary) -> tuple[float, float] | tuple[None, None]:
     except Exception:
         return None, None
 
-def resolve_px_um(summary, arg_px_x_um, arg_px_y_um) -> tuple[float, float]:
+def load_sidecar_summary_metadata(ndpath: Path) -> dict | None:
+    """
+    Load summary_metadata.json from the dataset directory if present.
+    Returns the parsed dict, or None if the file is missing/unusable.
+    """
+    sidecar_path = ndpath / "summary_metadata.json"
+    if not sidecar_path.exists():
+        return None
+    try:
+        with sidecar_path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+        print(f"[warn] {sidecar_path} is not a JSON object; ignoring sidecar metadata.")
+    except Exception as e:
+        print(f"[warn] Could not read {sidecar_path}: {e}")
+    return None
+
+def resolve_px_um(summary, ndpath: Path, arg_px_x_um, arg_px_y_um) -> tuple[float, float]:
     """
     Resolve pixel size (µm/px) from metadata or CLI args.
+    Preference order:
+      1. internal NDTiff summary metadata
+      2. ndpath/summary_metadata.json
+      3. CLI overrides, if both provided
     On failure, print the requested message and exit(1).
     """
     px_x_um, px_y_um = parse_px_um_from_affine(summary)
 
-    # If metadata missing/invalid, prefer CLI values
+    if px_x_um is None or px_y_um is None:
+        sidecar_summary = load_sidecar_summary_metadata(ndpath)
+        if sidecar_summary is not None:
+            px_x_um, px_y_um = parse_px_um_from_affine(sidecar_summary)
+            if px_x_um is not None and px_y_um is not None:
+                print(f"[info] Using px size from {ndpath / 'summary_metadata.json'}")
+
+    # If internal + sidecar metadata missing/invalid, prefer CLI values
     if px_x_um is None or px_y_um is None:
         if arg_px_x_um is not None and arg_px_y_um is not None:
             return float(arg_px_x_um), float(arg_px_y_um)
@@ -290,7 +319,7 @@ def main():
     summary = ds.summary_metadata
 
     # --- resolve pixel size (with graceful fallback to CLI & user message) ---
-    px_x_um, px_y_um = resolve_px_um(summary, args.px_x_um, args.px_y_um)
+    px_x_um, px_y_um = resolve_px_um(summary, ndpath, args.px_x_um, args.px_y_um)
     um_to_px_x = lambda um: um / px_x_um
     um_to_px_y = lambda um: um / px_y_um
 

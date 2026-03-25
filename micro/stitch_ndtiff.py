@@ -178,6 +178,16 @@ def scale_canvas_if_needed(img: pyvips.Image, scale: float, background=None) -> 
     return _similarity_with_optional_background(img, scale=scale, background=background)
 
 
+def flip_canvas_if_needed(img: pyvips.Image, flip_x: bool) -> pyvips.Image:
+    """
+    Flip the stitched image left/right before any rotation is applied.
+    """
+    if not flip_x:
+        return img
+    print("Flipping canvas: left/right")
+    return img.flip("horizontal")
+
+
 def rotate_canvas_if_needed(img: pyvips.Image, angle_deg: float, background=None) -> pyvips.Image:
     """
     Rotate the stitched image by angle_deg CCW.
@@ -276,6 +286,8 @@ def main():
     # Default output directory: <dataset>/stitched
     ap.add_argument("--out-dir", default=None, help="Output directory (default: <dataset>/stitched)")
     ap.add_argument("--scale", type=float, default=0.5, help="Master scale factor (1.0 = full-res)")
+    ap.add_argument("--flip-x", action=argparse.BooleanOptionalAction, default=False,
+                    help="Flip the final stitched image left/right before rotation.")
     ap.add_argument("--rotate", type=float, default=0.0, help="Optional rotation in degrees (CCW) applied to the final stitched image.")
     ap.add_argument("--feather-px", type=int, default=0, help="Feather width in pixels (0 = no feather)")
     ap.add_argument("--background", choices=["white","black"], default="white")
@@ -337,7 +349,7 @@ def main():
     SCALE = float(args.scale)
     W = max(1, int(Wn))
     H = max(1, int(Hn))
-    print(f"Canvas (native): {Wn}×{Hn}  |  scale={SCALE}  rotate={args.rotate}")
+    print(f"Canvas (native): {Wn}×{Hn}  |  scale={SCALE}  flip_x={args.flip_x}  rotate={args.rotate}")
 
     bgval = 255 if args.background.lower() == "white" else 0
     bg_rgb = [bgval, bgval, bgval]
@@ -401,7 +413,7 @@ def main():
 
         print(
             f"\n=== Z{z}: composing {len(dfz)} tiles on {W}×{H} "
-            f"(feather={args.feather_px}px, scale={SCALE}, rotate={args.rotate}, channel={'gray' if single_band else 'rgb'}) ==="
+            f"(feather={args.feather_px}px, scale={SCALE}, flip_x={args.flip_x}, rotate={args.rotate}, channel={'gray' if single_band else 'rgb'}) ==="
         )
 
         bad_tiles = 0
@@ -509,8 +521,9 @@ def main():
         except Exception:
             pass
 
-        # Apply global scale + rotation (matches stitch_h5data.py behavior)
+        # Apply global flip + scale + rotation.
         bg = bgval if single_band else bg_rgb
+        save_im = flip_canvas_if_needed(save_im, args.flip_x)
         save_im = scale_canvas_if_needed(save_im, SCALE, background=bg)
         save_im = rotate_canvas_if_needed(save_im, args.rotate, background=bg)
 

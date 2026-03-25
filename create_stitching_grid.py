@@ -19,6 +19,12 @@ def main():
         default=1.0,
         help="Global scale factor (unitless) applied to tile positions and sizes (default 1.0)."
     )
+    ap.add_argument(
+        "--flip-x",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Flip tile positions left/right across the full canvas before rotation."
+    )
     args = ap.parse_args()
 
     # input_folder contains a CSV whose name is always summary_table.csv
@@ -48,37 +54,48 @@ def main():
     # global, unitless scale factor
     scale = float(args.scale or 1.0)
 
-    items = []
     with open(csv_path, newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            x = float(row["X_rel_um"])
-            y = float(row["Y_rel_um"])
+        rows = list(csv.DictReader(f))
 
-            if use_rotation:
-                # global CCW rotation around the origin
-                xr = x * c - y * s
-                yr = x * s + y * c
-            else:
-                xr, yr = x, y
+    canvas_width_um = max(
+        float(row["X_rel_um"]) + float(row["TileWidth_um"])
+        for row in rows
+    ) if rows else 0.0
 
-            # apply global scale (unitless) in microns space
-            xs = xr * scale
-            ys = yr * scale
-            w = float(row["TileWidth_um"]) * scale
-            h = float(row["TileHeight_um"]) * scale
+    items = []
+    for row in rows:
+        x = float(row["X_rel_um"])
+        y = float(row["Y_rel_um"])
+        w_native = float(row["TileWidth_um"])
+        h_native = float(row["TileHeight_um"])
 
-            items.append({
-                "type": "rect",
-                "units": "microns",             # absolute µm; ignores sample origin in the UI
-                "x": xs,
-                "y": ys,
-                "width": w,
-                "height": h,
-                "fill": "none",                 # no fill
-                "stroke": "#e53935",            # thin red outline
-                "strokeWidth": 1,               # interpreted as px; app normalizes to width
-                "strokeDasharray": "3,3"        # dashed line
-            })
+        if args.flip_x:
+            x = canvas_width_um - (x + w_native)
+
+        # apply global scale (unitless) in microns space after optional flip
+        xs = x * scale
+        ys = y * scale
+        w = w_native * scale
+        h = h_native * scale
+
+        if use_rotation:
+            # global CCW rotation around the origin after flip + scale
+            xr = xs * c - ys * s
+            yr = xs * s + ys * c
+            xs, ys = xr, yr
+
+        items.append({
+            "type": "rect",
+            "units": "microns",             # absolute µm; ignores sample origin in the UI
+            "x": xs,
+            "y": ys,
+            "width": w,
+            "height": h,
+            "fill": "none",                 # no fill
+            "stroke": "#e53935",            # thin red outline
+            "strokeWidth": 1,               # interpreted as px; app normalizes to width
+            "strokeDasharray": "3,3"        # dashed line
+        })
 
     # optional: sort top-left ? bottom-right (not required)
     items.sort(key=lambda r: (r["y"], r["x"]))

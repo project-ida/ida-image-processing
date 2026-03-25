@@ -158,23 +158,35 @@ def _parse_numeric_expr(expr: str) -> float:
         return float(val)
 
 
+def _parse_bool(value: str) -> bool:
+    value = value.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Unsupported boolean value: {value!r}")
+
+
 def read_transform_args(ds_dir: Path, dry_run: bool = False) -> list[str]:
     """
-    Read rotation and scale from <ds_dir>/config.txt if present.
+    Read rotation, scale, and optional horizontal flip from <ds_dir>/config.txt if present.
 
       rotation=<float or simple expression>   (degrees, CCW)
       scale=<float or simple expression>      (dimensionless)
+      flip_x=<bool>                           (True/False, yes/no, 1/0)
 
     Returns a list of CLI args like:
-      ["--scale", "<scale>", "--rotate", "<rotation>"]
+      ["--scale", "<scale>", "--flip-x", "--rotate", "<rotation>"]
 
     - If scale is missing in config.txt, we fall back to the watcher
       CLI --scale value.
     - If rotation is missing, we simply omit --rotate.
+    - If flip_x is missing, we default to no horizontal flip.
     """
     cfg_path = ds_dir / "config.txt"
     rotation_val = None
     scale_val = None
+    flip_x_val = False
 
     if cfg_path.exists():
         try:
@@ -194,6 +206,8 @@ def read_transform_args(ds_dir: Path, dry_run: bool = False) -> list[str]:
                     rotation_val = _parse_numeric_expr(value)
                 elif key == "scale":
                     scale_val = _parse_numeric_expr(value)
+                elif key == "flip_x":
+                    flip_x_val = _parse_bool(value)
 
             if rotation_val is not None:
                 log_ds(
@@ -206,6 +220,13 @@ def read_transform_args(ds_dir: Path, dry_run: bool = False) -> list[str]:
                 log_ds(
                     ds_dir,
                     f"Using scale from config.txt: {scale_val}",
+                    dry_run=dry_run,
+                )
+
+            if flip_x_val:
+                log_ds(
+                    ds_dir,
+                    "Using horizontal flip from config.txt: flip_x=True",
                     dry_run=dry_run,
                 )
 
@@ -239,6 +260,9 @@ def read_transform_args(ds_dir: Path, dry_run: bool = False) -> list[str]:
 
     # Always pass scale (so downstream scripts can rely on it)
     args.extend(["--scale", str(scale_val)])
+
+    if flip_x_val:
+        args.append("--flip-x")
 
     # Only pass rotation if we actually have one
     if rotation_val is not None:
